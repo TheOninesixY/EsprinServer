@@ -51,6 +51,10 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def journal_download_name():
+    return "esprin-journal-{}.log".format(time.strftime("%Y%m%d-%H%M%S"))
+
+
 def sha256_text(text):
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -466,6 +470,29 @@ class Journal:
             "deleted": self.deleted,
         }
 
+    def summary(self):
+        exists = os.path.isfile(self.path)
+        size = 0
+        updated_at = 0
+        if exists:
+            try:
+                info = os.stat(self.path)
+                size = int(info.st_size)
+                updated_at = int(info.st_mtime * 1000)
+            except OSError:
+                size = 0
+                updated_at = 0
+        return {
+            "journalId": self.journal_id,
+            "latestSeq": self.latest_seq,
+            "ops": self.count,
+            "files": len(self.files),
+            "deleted": len(self.deleted),
+            "size": size,
+            "updatedAt": updated_at,
+            "exists": exists,
+        }
+
 
 MANAGER_DIR_NAME = "manager"
 MANAGER_INDEX_NAME = "index.html"
@@ -588,6 +615,37 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _send_manager_asset(self, path):
         self._send_static_asset(manager_dir(), path, MANAGER_INDEX_NAME)
+
+    def _send_journal_attachment(self):
+        target = self.journal.path
+        if not os.path.isfile(target):
+            self._send(404, {"ok": False, "error": "日志文件还不存在：服务端还没有收到任何同步操作"})
+            return
+
+        try:
+            size = os.path.getsize(target)
+            handle = open(target, "rb")
+        except OSError as error:
+            log("ERROR", "Journal", "读取失败: {} (path={})".format(error, target))
+            self._send(500, {"ok": False, "error": "读取日志失败"})
+            return
+
+        with handle:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+            self.send_header("Content-Length", str(size))
+            self.send_header("Content-Disposition",
+                             'attachment; filename="{}"'.format(journal_download_name()))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
+            remaining = size
+            while remaining > 0:
+                chunk = handle.read(min(262144, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def _authorize_api(self):
         header = self.headers.get("Authorization", "")
@@ -778,6 +836,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "tokens": self.admin.list_tokens()})
             return
 
+        if path == API_PREFIX + "/journal":
+            payload = self.journal.summary()
+            payload["ok"] = True
+            self._send(200, payload)
+            return
+
+        if path == API_PREFIX + "/journal/download":
+            self._send_journal_attachment()
+            return
+
         self._send(404, {"ok": False, "error": "未知接口"})
 
     def _handle_admin_post(self, path, payload):
@@ -945,6 +1013,16 @@ def selftest():
         def post(path, payload, token="secret", cookie=False, origin=None):
             return call("POST", path, payload, token=token, use_cookie=cookie, origin=origin)
 
+        def download(path, cookie=True):
+            request = urllib.request.Request(base + path, method="GET")
+            if cookie and cookies:
+                request.add_header("Cookie", "; ".join(f"{key}={value}" for key, value in cookies.items()))
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return response.status, response.headers, response.read().decode("utf-8")
+            except urllib.error.HTTPError as error:
+                return error.code, error.headers, error.read().decode("utf-8")
+
         sync = SYNC_PATH
 
         log("INFO", "Selftest", "section=config")
@@ -1063,6 +1141,25 @@ def selftest():
         status, body = get(API_PREFIX + "/tokens", token=None, cookie=True)
         check("登录后可以看令牌列表", status == 200 and body.get("tokens") == [], repr(body))
 
+        status, body = get(API_PREFIX + "/journal", token=None)
+        check("未登录不能看日志概览", status == 401, repr(body))
+
+        status, body = get(API_PREFIX + "/journal", token=None, cookie=True)
+        check("日志概览：操作数、存活文件与删除记录",
+              status == 200 and body.get("ops") == 3 and body.get("files") == 1
+              and body.get("deleted") == 1 and body.get("latestSeq") == 3
+              and body.get("size") > 0 and body.get("exists") is True, repr(body))
+
+        status, headers, _ = download(API_PREFIX + "/journal/download", cookie=False)
+        check("未登录不能下载日志", status == 401, str(status))
+
+        status, headers, text = download(API_PREFIX + "/journal/download")
+        lines = [line for line in text.splitlines() if line.strip()]
+        disposition = headers.get("Content-Disposition") or ""
+        check("下载日志：附件名与内容都是完整的操作行",
+              status == 200 and "attachment" in disposition and 'filename="esprin-journal-' in disposition
+              and len(lines) == 3 and _json.loads(lines[-1]).get("seq") == 3, repr(text)[:160])
+
         status, body = get(sync + "/state", token=None, cookie=True)
         check("同源管理后台持登录态可读同步接口", status == 200 and "files" in body, repr(body)[:120])
         status, body = get(sync + "/state", token=None, cookie=True, origin="https://evil.example")
@@ -1174,6 +1271,12 @@ def selftest():
         check("存活文件一致", sorted(reloaded.files.keys()) == ["notes/bound.md", "notes/one.md"], repr(reloaded.files))
         check("删除记录一致", reloaded.deleted.get("notes/two.md") == 3, repr(reloaded.deleted))
         check("重启后仍能续写", reloaded.append_many("dev-a", [{"opId": "a-4", "op": "put", "path": "notes/three.md", "data": "3"}])[0]["seq"] == 5)
+
+        blank = Journal(os.path.join(tmp, "blank-data"))
+        blank_summary = blank.summary()
+        check("空日志的概览：还没有任何操作",
+              blank_summary["ops"] == 0 and blank_summary["size"] == 0 and blank_summary["exists"] is False,
+              repr(blank_summary))
 
         log("INFO", "Selftest", "section=reload-admin")
         reloaded_admin = AdminStore(data_dir)

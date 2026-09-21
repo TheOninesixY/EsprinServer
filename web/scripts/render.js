@@ -64,26 +64,18 @@ function renderFolders() {
                 <span class="ms-icon sm">folder</span>
                 <span class="nav-text">${escapeHTML(folder)}</span>
             </div>
-            ${folder !== DEFAULT_FOLDER ? `
-                <button class="btn-del-folder" type="button" title="删除文件夹">
-                    <span class="ms-icon xs">close</span>
-                </button>
-            ` : ''}
         `;
 
-        item.addEventListener('click', (event) => {
-            if (event.target.closest('.btn-del-folder')) return;
+        item.addEventListener('click', () => {
             State.currentFilter = `folder:${folder}`;
             renderApp();
         });
 
-        const delBtn = item.querySelector('.btn-del-folder');
-        if (delBtn) {
-            delBtn.addEventListener('click', (event) => {
-                event.stopPropagation();
-                removeFolder(folder);
-            });
-        }
+        // 改名与删除统一收进右键菜单，条目上不再挂删除按钮
+        item.addEventListener('contextmenu', (event) => {
+            event.preventDefault();
+            showFolderContextMenu(event.clientX, event.clientY, folder);
+        });
         container.appendChild(item);
     });
 }
@@ -829,6 +821,16 @@ function showItemContextMenu(x, y, itemId) {
         entries.push({ icon: 'delete', label: '移入废纸篓', danger: true, action: () => moveToTrash(itemId) });
     }
     buildContextMenu(x, y, entries, 'item');
+}
+
+/* 文件夹右键菜单：重命名与删除。
+   「默认」是条目没有归属时的落脚点，既不能改名也不能删除，因此不为它开菜单 */
+function showFolderContextMenu(x, y, folder) {
+    if (folder === DEFAULT_FOLDER) return;
+    buildContextMenu(x, y, [
+        { icon: 'edit', label: '重命名文件夹', action: () => renameFolder(folder) },
+        { icon: 'delete', label: '删除文件夹', danger: true, action: () => removeFolder(folder) }
+    ], 'folder');
 }
 
 function showTabContextMenu(x, y, tabId) {

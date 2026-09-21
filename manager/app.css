@@ -519,6 +519,18 @@ code {
     color: var(--text-muted);
 }
 
+/* 日志概览：一串纯文本的统计值，等宽字体让它与说明文字区别开 */
+.journal-meta {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--text-secondary);
+    word-break: break-all;
+}
+
+#journal-status[data-tone="ok"] { color: var(--accent); }
+#journal-status[data-tone="error"] { color: var(--danger); }
+
 .secret-box {
     display: flex;
     flex-direction: column;

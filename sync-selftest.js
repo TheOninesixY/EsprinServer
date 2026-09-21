@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const assert = require('node:assert');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 function findSyncModule() {
@@ -79,6 +80,71 @@ check('同一路径的连续改动合并成一条', () => {
   list = sync.mergeOutboxOp(list, { opId: '3', path: 'notes/a.md', op: 'del', time: 3 });
   list = sync.mergeOutboxOp(list, { opId: '4', path: 'notes/b.md', op: 'put', time: 4 });
   assert.deepStrictEqual(list.map((op) => op.opId), ['3', '4']);
+});
+
+log('INFO', 'Selftest', 'section=journal-file');
+check('逐行解析日志：合法行留下，坏行只计数', () => {
+  const parsed = sync.parseJournalText([
+    '{"seq":1,"op":"put","path":"notes/a.md","data":"第一篇","device":"dev-a"}',
+    '',
+    'not json',
+    '{"seq":2,"op":"del","path":"notes/a.md","device":"dev-b"}',
+    '{"seq":3,"op":"put","path":"../evil.md","data":"x"}',
+    '{"seq":4,"op":"put","path":"notes/b.md"}',
+    '{"seq":5,"op":"rename","path":"notes/c.md"}'
+  ].join('\n'));
+  assert.strictEqual(parsed.entries.length, 2);
+  assert.strictEqual(parsed.invalid, 4);
+  assert.strictEqual(parsed.latestSeq, 2);
+  assert.deepStrictEqual(parsed.devices, ['dev-a', 'dev-b']);
+});
+check('没有序号的日志按文件顺序重放', () => {
+  const entries = [{ op: 'put', path: 'notes/a.md' }, { op: 'del', path: 'notes/a.md' }];
+  assert.deepStrictEqual(sync.orderJournalEntries(entries), entries);
+});
+check('都带序号时按序号重排', () => {
+  const ordered = sync.orderJournalEntries([
+    { seq: 3, op: 'put', path: 'notes/c.md' },
+    { seq: 1, op: 'put', path: 'notes/a.md' },
+    { seq: 2, op: 'del', path: 'notes/a.md' }
+  ]);
+  assert.deepStrictEqual(ordered.map((entry) => entry.seq), [1, 2, 3]);
+});
+check('最终状态：删除过的路径不留下，后写的内容覆盖先前', () => {
+  const final = sync.journalFinalState([
+    { seq: 1, op: 'put', path: 'notes/a.md', data: '第一版' },
+    { seq: 2, op: 'put', path: 'notes/b.md', data: '第二篇' },
+    { seq: 3, op: 'del', path: 'notes/b.md' },
+    { seq: 4, op: 'put', path: 'notes/a.md', data: '第二版' }
+  ]);
+  assert.deepStrictEqual([...final.keys()], ['notes/a.md']);
+  assert.strictEqual(final.get('notes/a.md').data, '第二版');
+});
+check('重放：写入、删除，以及在本地不存在时的跳过', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'esprin-journal-'));
+  try {
+    const applied = sync.applyJournalEntries([
+      { op: 'put', path: 'notes/a.md', data: '第一篇', encoding: 'utf8' },
+      { op: 'put', path: 'notes/sub/b.md', data: '第二篇', encoding: 'utf8' },
+      { op: 'del', path: 'notes/sub/b.md' },
+      { op: 'del', path: 'notes/gone.md' }
+    ], dir);
+    assert.strictEqual(applied.written, 2);
+    assert.strictEqual(applied.deleted, 1);
+    assert.strictEqual(applied.skipped, 1);
+    assert.deepStrictEqual(applied.errors, []);
+    assert.strictEqual(fs.readFileSync(path.join(dir, 'notes', 'a.md'), 'utf8'), '第一篇');
+    assert.ok(!fs.existsSync(path.join(dir, 'notes', 'sub', 'b.md')));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+check('导出目标不允许落在数据目录内', () => {
+  const dataDir = path.join(__dirname, 'tmp-data');
+  assert.strictEqual(sync.isSameOrInside(dataDir, dataDir), true);
+  assert.strictEqual(sync.isSameOrInside(path.join(dataDir, 'notes'), dataDir), true);
+  assert.strictEqual(sync.isSameOrInside(path.join(dataDir, '..', 'out'), dataDir), false);
+  assert.strictEqual(sync.isSameOrInside(path.join(dataDir, '..', 'tmp-data-2'), dataDir), false);
 });
 
 function createServer() {

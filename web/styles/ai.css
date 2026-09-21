@@ -324,7 +324,16 @@
     border-style: dashed;
     color: var(--text-muted);
 }
-.ai-msg-content {
+/* 回复正文允许拖选，与桌面版（EsprinNemo 的 src/renderer/styles/ai.css）同一条规则：
+   桌面版那边是必需的——全局重置把每个元素都写成 user-select: none，而该属性不继承，
+   子节点不会从父节点顺回 text，所以正文与它内部的 Markdown 节点必须一起放行；
+   网页版再补一份 -webkit- 前缀，iOS Safari 的长按拖选才认。
+   Agent 卡片里的步骤摘要与详情同理 */
+.ai-msg-content,
+.ai-msg-content *,
+.ai-step-label,
+.ai-step-detail {
+    -webkit-user-select: text;
     user-select: text;
     cursor: text;
 }

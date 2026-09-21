@@ -153,6 +153,9 @@ const state = {
     tokenCount: 0,
 };
 
+// 数据与日志一节的常驻说明：登录前、出错时都会回到这句
+const JOURNAL_IDLE_HINT = '下载得到的是 journal.log 的当前快照；这台服务器上的全部笔记与待办就在其中。';
+
 function render() {
     $('view-setup').hidden = state.passwordSet;
     $('view-login').hidden = !state.passwordSet || state.loggedIn;
@@ -163,6 +166,11 @@ function render() {
         $('header-desc').textContent = state.tokenCount > 0
             ? '管理 ' + state.tokenCount + ' 个访问令牌与它们绑定的设备。令牌明文只在创建或重置的那一瞬间出现，服务端只保存摘要。'
             : '给每台设备建一个访问令牌，客户端用它同步笔记与待办。令牌明文只在创建时出现一次，服务端只保存摘要。';
+    } else {
+        $('journal-summary').textContent = '登录后可以查看与下载日志';
+        $('journal-summary').title = '';
+        $('journal-download').disabled = true;
+        setMessage('journal-status', JOURNAL_IDLE_HINT);
     }
 }
 
@@ -173,7 +181,10 @@ async function refresh() {
     state.tokenCount = Number(data.tokenCount) || 0;
     render();
 
-    if (state.loggedIn) await loadTokens();
+    if (state.loggedIn) {
+        await loadTokens();
+        await loadJournal();
+    }
 }
 
 function showSecret(id) {
@@ -333,6 +344,120 @@ async function loadTokens() {
     $('token-empty').hidden = records.length > 0;
 }
 
+function formatFileSize(bytes) {
+    const size = Number(bytes) || 0;
+    if (size < 1024) return size + ' B';
+    if (size < 1024 * 1024) return (size / 1024).toFixed(1) + ' KB';
+    return (size / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+function describeJournal(data) {
+    if (!data || !data.exists || !Number(data.ops)) return '';
+    return Number(data.ops) + ' 条操作 · 存活文件 ' + Number(data.files) + ' · 删除记录 ' + Number(data.deleted)
+        + ' · 最新序号 ' + Number(data.latestSeq) + ' · ' + formatFileSize(data.size)
+        + ' · 最后写入 ' + formatTime(data.updatedAt);
+}
+
+async function loadJournal() {
+    const summary = $('journal-summary');
+    const button = $('journal-download');
+    const { status, data } = await api('/journal');
+    if (status === 401) {
+        state.loggedIn = false;
+        render();
+        return;
+    }
+
+    if (status !== 200) {
+        summary.textContent = '读取日志状态失败：' + ((data && data.error) || 'HTTP ' + status);
+        summary.title = '';
+        button.disabled = true;
+        return;
+    }
+
+    const text = describeJournal(data);
+    if (!text) {
+        summary.textContent = '还没有任何操作：客户端同步过一次之后，日志里才会有内容';
+        summary.title = '';
+        button.disabled = true;
+        return;
+    }
+
+    summary.textContent = text;
+    // 日志身份：与客户端「诊断」报告里的同一项对得上，说明两边看的是同一份日志
+    summary.title = data.journalId ? '日志身份：' + data.journalId : '';
+    button.disabled = false;
+}
+
+function attachmentFileName(header) {
+    const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(String(header || ''));
+    if (!match) return '';
+    const value = match[1].trim();
+    try {
+        return decodeURIComponent(value);
+    } catch (error) {
+        return value;
+    }
+}
+
+function saveBlob(blob, name) {
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = name;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+async function downloadJournal() {
+    const button = $('journal-download');
+    if (button.disabled) return;
+
+    let sessionLost = false;
+    button.disabled = true;
+    button.dataset.idle = button.textContent;
+    button.textContent = '准备下载…';
+    setMessage('journal-status', '正在从服务端读取日志…');
+
+    try {
+        const response = await fetch(API_BASE + '/journal/download', { credentials: 'same-origin' });
+        if (!response.ok) {
+            let data = {};
+            try {
+                data = await response.json();
+            } catch (error) {
+                data = {};
+            }
+            if (response.status === 401) {
+                sessionLost = true;
+                state.loggedIn = false;
+                render();
+                return;
+            }
+            const message = (data && data.error) || ('下载失败（HTTP ' + response.status + '）');
+            setMessage('journal-status', message, 'error');
+            toast(message, 'error');
+            return;
+        }
+
+        const blob = await response.blob();
+        const name = attachmentFileName(response.headers.get('Content-Disposition')) || 'journal.log';
+        saveBlob(blob, name);
+        setMessage('journal-status', '已下载 ' + name + '（' + formatFileSize(blob.size) + '）：在 EsprinNemo 的'
+            + '「设置 → 数据与存储 → 文件日志」里可以导入它，或把它摊成一个文件夹。', 'ok');
+        toast('日志已下载：' + name);
+    } catch (error) {
+        setMessage('journal-status', '下载失败，请检查网络后重试', 'error');
+        toast('下载失败，请检查网络后重试', 'error');
+    } finally {
+        button.textContent = button.dataset.idle || '下载日志';
+        // 下载期间可能又有新的操作写进日志：顺手刷新一次概览（它也会重新决定按钮是否可用）
+        if (!sessionLost) await loadJournal();
+    }
+}
+
 async function submitSetup() {
     const password = $('setup-pass').value;
     if (password.length < 8) return setMessage('setup-msg', '密码至少 8 位', 'error');
@@ -403,6 +528,17 @@ function bindEvents() {
     $('reset-copy').addEventListener('click', (event) => copyElement('reset-token', event.currentTarget));
     selectAllOnClick('new-token');
     selectAllOnClick('reset-token');
+
+    $('journal-refresh').addEventListener('click', async () => {
+        await loadJournal();
+        toast('日志概览已刷新');
+    });
+    $('journal-download').addEventListener('click', () => {
+        downloadJournal().catch((error) => {
+            console.error(error);
+            setMessage('journal-status', '下载失败，请检查网络后重试', 'error');
+        });
+    });
 
     [['setup-pass', 'setup-pass2', submitSetup], ['login-pass', null, submitLogin], ['pass-new', 'pass-new2', submitPasswordChange]]
         .forEach(([first, second, handler]) => {

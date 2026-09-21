@@ -95,6 +95,40 @@ const Markdown = {
         // 分割线
         text = text.replace(/^(?:---|\*\*\*|___)\s*$/gm, '<hr>');
 
+        // 表格：表头行 + 分隔行（用 : 决定该列对齐）+ 若干表体行。
+        // 以「分隔行」为成立条件，正文里零星出现的竖线因此不会被误判成表格；
+        // 行首行尾的竖线可有可无，两种写法都兼容
+        text = text.replace(
+            /(^[ \t]*\|?[^\r\n|]*(?:\|[^\r\n|]*)+[ \t]*\|?[ \t]*\r?\n)(^[ \t]*\|?[ \t]*:?-+:?[ \t]*(?:\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*\r?\n)((?:^[ \t]*\|?[^\r\n|]*(?:\|[^\r\n|]*)+[ \t]*\|?[ \t]*(?:\r?\n|$))*)/gm,
+            (block, headerRow, dividerRow, bodyRows) => {
+                // 去掉首尾竖线后按 | 切列
+                const splitCells = (row) => row
+                    .trim()
+                    .replace(/^\||\|$/g, '')
+                    .split('|')
+                    .map(cell => cell.trim());
+                const aligns = splitCells(dividerRow).map(spec => {
+                    const left = spec.startsWith(':');
+                    const right = spec.endsWith(':');
+                    if (left && right) return 'center';
+                    if (right) return 'right';
+                    if (left) return 'left';
+                    return '';
+                });
+                const alignStyle = (index) => (aligns[index] ? ` style="text-align: ${aligns[index]}"` : '');
+                const head = splitCells(headerRow)
+                    .map((cell, i) => `<th${alignStyle(i)}>${cell}</th>`)
+                    .join('');
+                const body = bodyRows
+                    .split(/\r?\n/)
+                    .filter(row => row.trim())
+                    .map(row => `<tr>${splitCells(row).map((cell, i) => `<td${alignStyle(i)}>${cell}</td>`).join('')}</tr>`)
+                    .join('');
+                // 外层容器负责窄屏横向滚动；前后补空行，避免表格被并进相邻段落
+                return `\n\n<div class="md-table-wrap"><table><thead><tr>${head}</tr></thead>${body ? `<tbody>${body}</tbody>` : ''}</table></div>\n\n`;
+            }
+        );
+
         // 引用块（支持多行连续引用）
         text = text.replace(/(?:^&gt; ?[^\r\n]*(?:\r?\n|$))+/gm, (block) => {
             const inner = block

@@ -117,23 +117,6 @@
     max-height: 180px;
     overflow-y: auto;
 }
-.folder-item {
-    position: relative;
-}
-.folder-item:hover .btn-del-folder {
-    opacity: 1;
-}
-.btn-del-folder {
-    width: 18px;
-    height: 18px;
-    border-radius: var(--radius-sm);
-    opacity: 0;
-    color: var(--text-muted);
-}
-.btn-del-folder:hover {
-    color: var(--danger);
-}
-
 .tag-list {
     display: flex;
     flex-wrap: wrap;
@@ -169,7 +152,8 @@
     border-top: 1px solid var(--border-light);
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    /* 图标组整体靠右，与左端的概览文字分开（真正的推手是 #sidebar-stat 的 margin-right: auto） */
+    justify-content: flex-end;
     gap: 6px;
     font-size: 11px;
     color: var(--text-muted);
@@ -198,11 +182,13 @@
     background-color: var(--item-hover);
     color: var(--text-primary);
 }
-#btn-open-settings {
-    margin-left: auto;
-}
+/* 底栏概览文字独占左端：margin-right: auto 吸收全部剩余空间，右侧图标组整体贴到右缘，
+   清空废纸篓因此紧挨设置按钮左侧（它按 DOM 顺序本就排在设置之前）。
+   自动外边距挂在概览文字而非图标上：概览文字常驻，图标会随视图隐藏，自动外边距不会随之失效。
+   过长时省略文字，不换行也不把按钮挤出侧边栏 */
 #sidebar-stat {
     min-width: 0;
+    margin-right: auto;
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
@@ -241,9 +227,6 @@ html.sidebar-collapsed .sidebar .btn-clear-trash {
 html.sidebar-collapsed .sidebar .btn-sidebar-bottom {
     width: 24px;
     height: 24px;
-}
-html.sidebar-collapsed .sidebar #btn-open-settings {
-    margin-left: 0;
 }
 
 /* 收起 / 展开时文字与底栏图标的渐隐渐显 */

@@ -566,7 +566,6 @@ html.modern-layout {
 @media (hover: none) and (pointer: coarse) {
     /* 触摸没有悬停：点一下就停住的悬停态会留在屏幕上。
        把「悬停才出现」的操作改为常显，反馈交给 :active */
-    .btn-del-folder,
     .ai-chat-item-actions,
     .ai-msg-actions {
         opacity: 1;

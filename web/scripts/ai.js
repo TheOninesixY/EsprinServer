@@ -1047,6 +1047,13 @@ function updateStreamingBubble(message) {
     if (!last) return;
     const content = last.querySelector('.ai-msg-content');
     if (!content) return;
+
+    // 用户正在气泡里拖选时不重写：innerHTML 一换选区就没了，
+    // 回答还在流式输出时就会怎么拖都选不住。
+    // 返回不等丢内容——下一个增量还会调进来，流结束时还会走一次完整渲染
+    const selection = window.getSelection();
+    if (selection && !selection.isCollapsed && content.contains(selection.anchorNode)) return;
+
     content.innerHTML = Markdown.parse(message.content || '');
     scrollAiToBottom();
 }

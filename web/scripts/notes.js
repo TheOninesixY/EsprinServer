@@ -299,6 +299,41 @@ async function addFolder() {
     showToast(`已创建文件夹「${name}」`);
 }
 
+async function renameFolder(folder) {
+    const name = await showPrompt('重命名文件夹', {
+        title: '重命名文件夹',
+        detail: '文件夹中的笔记与待办会一并跟随新名称，内容本身不变。',
+        icon: 'edit',
+        label: '文件夹名称',
+        value: folder,
+        placeholder: '例如：工作',
+        confirmLabel: '重命名'
+    });
+    if (name === null) return;
+    if (!name) {
+        showToast('重命名失败：文件夹名称不能为空');
+        return;
+    }
+    if (name === folder) return;
+    if (State.folders.includes(name)) {
+        showToast('重命名失败：同名文件夹已存在');
+        return;
+    }
+
+    State.folders = State.folders.map((item) => (item === folder ? name : item));
+    [...State.notes, ...State.todos].forEach((item) => {
+        if (item.folder !== folder) return;
+        item.folder = name;
+        item.updatedAt = Date.now();
+        saveItem(item);
+    });
+    // 正停在该文件夹的视图跟着换到新名字上，否则筛选条件会指向一个已不存在的文件夹
+    if (State.currentFilter === `folder:${folder}`) State.currentFilter = `folder:${name}`;
+    saveConfig();
+    renderApp();
+    showToast(`已重命名为「${name}」`);
+}
+
 async function removeFolder(folder) {
     const confirmed = await showConfirm(`删除文件夹“${folder}”？`, {
         title: '删除文件夹',

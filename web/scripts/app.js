@@ -355,7 +355,7 @@ function bindEvents() {
         if (!event.target.closest('#context-menu')) hideContextMenu();
     });
     document.addEventListener('contextmenu', (event) => {
-        if (!event.target.closest('.note-card, .tab-item')) hideContextMenu();
+        if (!event.target.closest('.note-card, .tab-item, .folder-item')) hideContextMenu();
     });
     window.addEventListener('resize', hideContextMenu);
     window.addEventListener('scroll', hideContextMenu, true);
