@@ -1,21 +1,8 @@
 #!/usr/bin/env node
-/* 客户端同步逻辑自测：不需要服务端、不需要 Electron，一条命令就能验证
-   「操作日志」模型下最要紧的几件事。
-
-   运行：node server/sync-selftest.js
-
-   重点验证的场景（正是 WebDAV 那套做不到的）：
-   1. A 删掉笔记后，B 重放那条删除只是把本地文件删掉，绝不会反向产生一条「补回」操作；
-   2. B 之后再怎么同步，也不会把那篇笔记复活；
-   3. 本地比远端更新的未推送改动不会被远端旧操作覆盖；
-   4. 同一路径的连续改动在待推送队列里合并成一条；
-   5. 内容一致时不重复写盘；越界路径一律拒绝。
-*/
 const assert = require('node:assert');
 const fs = require('node:fs');
 const path = require('node:path');
 
-// 主进程模块的位置随目录摆放而变（server/ 与 src/ 平级，或 server/ 在 src/ 下），按存在的那个找
 function findSyncModule() {
   const candidates = [
     path.join(__dirname, '..', 'src', 'main', 'sync_server.js'),
@@ -42,8 +29,6 @@ function check(name, fn) {
     console.log(`  FAIL ${name}\n       ${error.message}`);
   }
 }
-
-/* ---------------- 纯逻辑 ---------------- */
 
 console.log('路径与哈希：');
 check('越界与空路径被拒绝', () => {
@@ -89,8 +74,6 @@ check('同一路径的连续改动合并成一条', () => {
   list = sync.mergeOutboxOp(list, { opId: '4', path: 'notes/b.md', op: 'put', time: 4 });
   assert.deepStrictEqual(list.map((op) => op.opId), ['3', '4']);
 });
-
-/* ---------------- 两台设备 + 内存服务端 ---------------- */
 
 function createServer() {
   const log = [];
@@ -148,7 +131,6 @@ function localDel(dev, filePath, time) {
   });
 }
 
-// 一次同步：先拉（重放远端操作）再推（把本地改动送上去），与服务端里的实现同一顺序
 function syncOnce(dev, server) {
   for (const op of server.since(dev.lastSeq)) {
     const pending = dev.outbox.find((item) => item.path === op.path) || null;
@@ -216,7 +198,6 @@ check('B 再同步一次也不会把笔记复活', () => {
   syncOnce(a, server);
   syncOnce(b, server);
 
-  // 反复同步：B 只是不断确认「已应用到最新序号」，不会做任何写盘
   syncOnce(b, server);
   syncOnce(b, server);
   assert.ok(!b.disk.has('notes/a.md'));
@@ -236,7 +217,6 @@ check('B 在删除之后又改了那篇笔记（更晚）→ 保留 B 的版本�
   localDel(a, 'notes/a.md', 2000);
   syncOnce(a, server);
 
-  // B 在 3000 这个更晚的时刻又写了内容
   localPut(b, 'notes/a.md', 'B 的新内容', 3000);
   syncOnce(b, server);
 
@@ -262,8 +242,6 @@ check('远端更新的内容会覆盖本地没有再改过的文件', () => {
 
   assert.strictEqual(b.disk.get('notes/a.md'), sync.hashBytes(Buffer.from('第二版')));
 });
-
-/* ---------------- 结果 ---------------- */
 
 console.log();
 if (failed) {

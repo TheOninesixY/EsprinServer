@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -14,6 +15,7 @@ from urllib.parse import urlparse, parse_qs
 
 SERVER_NAME = "EsprinServer"
 SERVER_VERSION = 1
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8686
 CONFIG_NAME = "config.json"
@@ -480,7 +482,7 @@ MISSING_PAGE_HTML = """<!DOCTYPE html>
 
 
 def manager_dir():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), MANAGER_DIR_NAME)
+    return os.path.join(SCRIPT_DIR, MANAGER_DIR_NAME)
 
 
 def read_manager_index():
@@ -898,21 +900,21 @@ def selftest():
         sync = SYNC_PATH
 
         print("配置：")
-        config_path = os.path.join(tmp, CONFIG_NAME)
-        check("没有 config.json 时全部走默认", read_config(tmp) == {}, repr(read_config(tmp)))
-        with open(config_path, "w", encoding="utf-8") as handle:
+        config_file = os.path.join(tmp, CONFIG_NAME)
+        with open(config_file, "w", encoding="utf-8") as handle:
             handle.write('{"host": "0.0.0.0", "port": 4936}')
+        check("优先用数据目录里的 config.json", config_path(tmp) == config_file, config_path(tmp))
         check("从 config.json 读地址与端口", read_config(tmp) == {"port": 4936, "host": "0.0.0.0"}, repr(read_config(tmp)))
-        with open(config_path, "w", encoding="utf-8") as handle:
+        with open(config_file, "w", encoding="utf-8") as handle:
             handle.write('{"host": "  ", "port": "abc"}')
         check("地址为空、端口不是数字时都忽略", read_config(tmp) == {}, repr(read_config(tmp)))
-        with open(config_path, "w", encoding="utf-8") as handle:
+        with open(config_file, "w", encoding="utf-8") as handle:
             handle.write('{"port": 70000}')
         check("端口超出范围时忽略", read_config(tmp) == {}, repr(read_config(tmp)))
-        with open(config_path, "w", encoding="utf-8") as handle:
+        with open(config_file, "w", encoding="utf-8") as handle:
             handle.write('not json')
         check("config.json 不是 JSON 时忽略", read_config(tmp) == {}, repr(read_config(tmp)))
-        os.remove(config_path)
+        os.remove(config_file)
 
         print("接口：")
         status, health = get(sync + "/health", token=None)
@@ -1079,8 +1081,19 @@ def selftest():
     return 0
 
 
+def config_path(data_dir):
+    for candidate in (
+        os.path.join(data_dir, CONFIG_NAME),
+        os.path.join(SCRIPT_DIR, CONFIG_NAME),
+        os.path.join(SCRIPT_DIR, "data", CONFIG_NAME),
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return os.path.join(data_dir, CONFIG_NAME)
+
+
 def read_config(data_dir):
-    path = os.path.join(data_dir, CONFIG_NAME)
+    path = config_path(data_dir)
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
@@ -1105,6 +1118,18 @@ def read_config(data_dir):
     return config
 
 
+def lan_address():
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            return probe.getsockname()[0]
+        finally:
+            probe.close()
+    except OSError:
+        return ""
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Esprin Nemo 同步服务端（操作日志）")
     parser.add_argument("--host", help=f"监听地址，不传则用 {CONFIG_NAME} 里的 host，再不行用 {DEFAULT_HOST}（局域网共享可写 0.0.0.0）")
@@ -1120,25 +1145,33 @@ def main(argv=None):
     data_dir = os.path.abspath(args.data)
     os.makedirs(data_dir, exist_ok=True)
 
+    config_file = config_path(data_dir)
     config = read_config(data_dir)
-    config_note = os.path.join(args.data, CONFIG_NAME)
     host = args.host or config.get("host") or DEFAULT_HOST
     port = args.port or config.get("port") or DEFAULT_PORT
-    host_source = "--host 参数" if args.host else (config_note if config.get("host") else "内置默认值")
-    port_source = "--port 参数" if args.port else (config_note if config.get("port") else "内置默认值")
+    host_source = "--host 参数" if args.host else (config_file if config.get("host") else "内置默认值")
+    port_source = "--port 参数" if args.port else (config_file if config.get("port") else "内置默认值")
 
     httpd, journal, admin = create_server(host, port, data_dir, args.token)
 
+    bound_host, bound_port = httpd.server_address[:2]
+    if bound_host in ("0.0.0.0", "::", ""):
+        url_host = lan_address() or DEFAULT_HOST
+    else:
+        url_host = bound_host
+
     if host_source == port_source:
-        where = f"地址与端口来自 {host_source}"
+        where = f"来自 {host_source}"
     else:
         where = f"地址来自 {host_source}，端口来自 {port_source}"
 
     print(f"{SERVER_NAME} v{SERVER_VERSION} 已启动")
-    print(f"  监听：http://{host}:{port}（{where}）")
-    print(f"  同步：http://{host}:{port}{SYNC_PATH}/*（客户端里只填 http://{host}:{port} 就行）")
+    print(f"  数据：{data_dir}")
+    print(f"  配置：{config_file}" + ("" if os.path.isfile(config_file) else "（这个文件不存在，地址与端口都走默认值）"))
+    print(f"  监听：{bound_host}:{bound_port}（{where}）")
+    print(f"  同步：http://{url_host}:{bound_port}{SYNC_PATH}/*（客户端里只填 http://{url_host}:{bound_port} 就行）")
     print(f"  日志：{os.path.join(data_dir, JOURNAL_NAME)}（journalId {journal.journal_id}）")
-    print(f"  管理：http://{host}:{port}{ADMIN_PATH} "
+    print(f"  管理：http://{url_host}:{bound_port}{ADMIN_PATH} "
           + ("（已设置管理密码）" if admin.password_set() else "（首次打开会引导你设置管理密码）"))
     print(f"  授权：{'--token 已启用' if args.token else '由管理后台发放令牌'}，"
           f"当前 {len(admin.list_tokens())} 个令牌")
