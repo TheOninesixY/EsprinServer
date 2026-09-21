@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EsprinServer</title>
+<link rel="icon" type="image/png" href="/admin/favicon.png">
+<link rel="stylesheet" href="/admin/app.css">
+<script src="/admin/app.js" defer></script>
+</head>
+<body>
+<div class="app-container">
+
+    <header class="titlebar">
+        <span class="titlebar-brand">EsprinServer</span>
+        <span class="titlebar-divider"></span>
+        <span class="titlebar-title">EsprinNemo同步服务端</span>
+        <span class="titlebar-spacer"></span>
+        <span class="titlebar-actions">
+            <button class="settings-btn icon-only" id="logout-btn" type="button"
+                    title="退出登录" aria-label="退出登录" hidden>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+                     stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M13 3.5H6.5A1.5 1.5 0 0 0 5 5v14a1.5 1.5 0 0 0 1.5 1.5H13"/>
+                    <path d="M12 12h9"/>
+                    <path d="M17.5 8.5 21 12l-3.5 3.5"/>
+                </svg>
+            </button>
+        </span>
+    </header>
+
+    <section class="gate" id="view-setup" hidden>
+        <div class="gate-card">
+            <span class="gate-brand">EsprinServer</span>
+            <h1 class="gate-title">设置管理密码</h1>
+            <p class="gate-desc">这个密码只用于打开本页面，不会发给客户端。它以 PBKDF2 摘要保存，原文不落盘。</p>
+            <label class="gate-field">
+                <span class="gate-field-label">管理密码</span>
+                <input class="settings-input gate-input" id="setup-pass" type="password" autocomplete="new-password" placeholder="至少 8 位">
+            </label>
+            <label class="gate-field">
+                <span class="gate-field-label">再输一遍</span>
+                <input class="settings-input gate-input" id="setup-pass2" type="password" autocomplete="new-password" placeholder="重复上面的密码">
+            </label>
+            <p class="form-msg" id="setup-msg"></p>
+            <button class="settings-btn primary gate-submit" id="setup-btn" type="button">设置密码并进入</button>
+        </div>
+    </section>
+
+    <section class="gate" id="view-login" hidden>
+        <div class="gate-card">
+            <span class="gate-brand">EsprinNemo</span>
+            <h1 class="gate-title">登录管理后台</h1>
+            <p class="gate-desc">管理访问令牌与它们绑定的设备。连续输错会被暂时限制登录。</p>
+            <label class="gate-field">
+                <span class="gate-field-label">管理密码</span>
+                <input class="settings-input gate-input" id="login-pass" type="password" autocomplete="current-password" placeholder="管理密码">
+            </label>
+            <p class="form-msg" id="login-msg"></p>
+            <button class="settings-btn primary gate-submit" id="login-btn" type="button">登录</button>
+        </div>
+    </section>
+
+    <div class="settings-view" id="view-panel" hidden>
+        <div class="settings-content">
+            <div class="settings-header">
+                <div class="settings-title">同步服务端</div>
+                <div class="settings-desc" id="header-desc">正在读取服务端状态…</div>
+            </div>
+
+            <div class="settings-section">
+                <div class="settings-section-title">新建令牌</div>
+                <div class="settings-row is-column">
+                    <div class="settings-row-info">
+                        <span class="settings-row-label">名称与绑定设备</span>
+                        <span class="settings-row-desc">名称只是给你自己看的；绑定了设备之后，用这个令牌提交的操作都会记成那台设备，客户端自报的设备名盖不回去。设备 id 可以留空</span>
+                    </div>
+                    <div class="row-controls">
+                        <input class="settings-input" id="new-name" type="text" maxlength="40" placeholder="名称，例如：台式机">
+                        <input class="settings-input mono" id="new-device" type="text" maxlength="40" placeholder="设备 id，可留空">
+                        <button class="settings-btn primary" id="new-btn" type="button">创建令牌</button>
+                    </div>
+                </div>
+
+                <div class="secret-box" id="new-secret" hidden>
+                    <div class="secret-head">
+                        <span class="secret-label">新令牌 · 只显示这一次</span>
+                        <button class="settings-btn" id="new-copy" type="button">复制令牌</button>
+                    </div>
+                    <code class="secret-value" id="new-token" tabindex="0" title="点一下全选"></code>
+                    <p class="secret-hint">把它填进 EsprinNemo 的「设置 → 数据与存储 → 自建同步 → 访问令牌」。离开本页之后就再也拿不到明文了，只能重置换一份新的。</p>
+                </div>
+
+                <div class="secret-box" id="reset-secret" hidden>
+                    <div class="secret-head">
+                        <span class="secret-label">重置后的新令牌 · 旧的已立即失效</span>
+                        <button class="settings-btn" id="reset-copy" type="button">复制令牌</button>
+                    </div>
+                    <code class="secret-value" id="reset-token" tabindex="0" title="点一下全选"></code>
+                    <p class="secret-hint">把新令牌重新填到对应客户端的设置里，旧令牌从现在起一律返回 401。</p>
+                </div>
+            </div>
+
+            <div class="settings-section">
+                <div class="settings-section-title">已有令牌</div>
+                <div class="settings-rows" id="token-list"></div>
+                <p class="empty-hint" id="token-empty">还没有令牌，先在上面创建一个。</p>
+            </div>
+
+            <div class="settings-section is-detached">
+                <div class="settings-section-title">管理密码</div>
+                <div class="settings-row is-column">
+                    <div class="settings-row-info">
+                        <span class="settings-row-label">修改管理密码</span>
+                        <span class="settings-row-desc">至少 8 位，两次输入的新密码必须一致。改完之后其他已登录的浏览器会立即退出，当前这个浏览器会自动续上登录态</span>
+                    </div>
+                    <div class="row-controls">
+                        <input class="settings-input" id="pass-old" type="password" autocomplete="current-password" placeholder="当前密码">
+                        <input class="settings-input" id="pass-new" type="password" autocomplete="new-password" placeholder="新密码（至少 8 位）">
+                        <input class="settings-input" id="pass-new2" type="password" autocomplete="new-password" placeholder="确认密码">
+                        <button class="settings-btn" id="pass-btn" type="button">修改密码</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+</body>
+</html>
