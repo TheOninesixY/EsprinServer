@@ -14,6 +14,7 @@ from urllib.parse import urlparse, parse_qs
 
 SERVER_NAME = "EsprinServer"
 SERVER_VERSION = 1
+DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8686
 CONFIG_NAME = "config.json"
 JOURNAL_NAME = "journal.log"
@@ -897,17 +898,20 @@ def selftest():
         sync = SYNC_PATH
 
         print("配置：")
-        check("没有 config.json 时不报错", read_config_port(tmp) == 0, str(read_config_port(tmp)))
         config_path = os.path.join(tmp, CONFIG_NAME)
+        check("没有 config.json 时全部走默认", read_config(tmp) == {}, repr(read_config(tmp)))
         with open(config_path, "w", encoding="utf-8") as handle:
-            handle.write('{"port": 4936}')
-        check("从 config.json 读端口", read_config_port(tmp) == 4936, str(read_config_port(tmp)))
+            handle.write('{"host": "0.0.0.0", "port": 4936}')
+        check("从 config.json 读地址与端口", read_config(tmp) == {"port": 4936, "host": "0.0.0.0"}, repr(read_config(tmp)))
         with open(config_path, "w", encoding="utf-8") as handle:
-            handle.write('{"port": "abc"}')
-        check("端口不是数字时忽略", read_config_port(tmp) == 0, str(read_config_port(tmp)))
+            handle.write('{"host": "  ", "port": "abc"}')
+        check("地址为空、端口不是数字时都忽略", read_config(tmp) == {}, repr(read_config(tmp)))
         with open(config_path, "w", encoding="utf-8") as handle:
             handle.write('{"port": 70000}')
-        check("端口超出范围时忽略", read_config_port(tmp) == 0, str(read_config_port(tmp)))
+        check("端口超出范围时忽略", read_config(tmp) == {}, repr(read_config(tmp)))
+        with open(config_path, "w", encoding="utf-8") as handle:
+            handle.write('not json')
+        check("config.json 不是 JSON 时忽略", read_config(tmp) == {}, repr(read_config(tmp)))
         os.remove(config_path)
 
         print("接口：")
@@ -1075,25 +1079,35 @@ def selftest():
     return 0
 
 
-def read_config_port(data_dir):
+def read_config(data_dir):
     path = os.path.join(data_dir, CONFIG_NAME)
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, ValueError):
-        return 0
+        return {}
     if not isinstance(data, dict):
-        return 0
+        return {}
+
+    config = {}
+
     try:
         port = int(data.get("port") or 0)
     except (TypeError, ValueError):
-        return 0
-    return port if 1 <= port <= 65535 else 0
+        port = 0
+    if 1 <= port <= 65535:
+        config["port"] = port
+
+    host = str(data.get("host") or "").strip()
+    if host:
+        config["host"] = host
+
+    return config
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Esprin Nemo 同步服务端（操作日志）")
-    parser.add_argument("--host", default="127.0.0.1", help="监听地址，局域网内共享可写 0.0.0.0")
+    parser.add_argument("--host", help=f"监听地址，不传则用 {CONFIG_NAME} 里的 host，再不行用 {DEFAULT_HOST}（局域网共享可写 0.0.0.0）")
     parser.add_argument("--port", type=int, help=f"监听端口，不传则用 {CONFIG_NAME} 里的 port，再不行用 {DEFAULT_PORT}")
     parser.add_argument("--data", default="./data", help="日志存放目录")
     parser.add_argument("--token", default=os.environ.get("ESPRIN_TOKEN", ""), help="访问令牌，留空则不校验")
@@ -1106,22 +1120,25 @@ def main(argv=None):
     data_dir = os.path.abspath(args.data)
     os.makedirs(data_dir, exist_ok=True)
 
-    config_port = read_config_port(data_dir)
-    port = args.port or config_port or DEFAULT_PORT
-    if args.port:
-        port_source = "--port 参数"
-    elif config_port:
-        port_source = os.path.join(args.data, CONFIG_NAME)
-    else:
-        port_source = "内置默认值"
+    config = read_config(data_dir)
+    config_note = os.path.join(args.data, CONFIG_NAME)
+    host = args.host or config.get("host") or DEFAULT_HOST
+    port = args.port or config.get("port") or DEFAULT_PORT
+    host_source = "--host 参数" if args.host else (config_note if config.get("host") else "内置默认值")
+    port_source = "--port 参数" if args.port else (config_note if config.get("port") else "内置默认值")
 
-    httpd, journal, admin = create_server(args.host, port, data_dir, args.token)
+    httpd, journal, admin = create_server(host, port, data_dir, args.token)
+
+    if host_source == port_source:
+        where = f"地址与端口来自 {host_source}"
+    else:
+        where = f"地址来自 {host_source}，端口来自 {port_source}"
 
     print(f"{SERVER_NAME} v{SERVER_VERSION} 已启动")
-    print(f"  监听：http://{args.host}:{port}（端口来自 {port_source}）")
-    print(f"  同步：http://{args.host}:{port}{SYNC_PATH}/*（客户端里只填 http://{args.host}:{port} 就行）")
+    print(f"  监听：http://{host}:{port}（{where}）")
+    print(f"  同步：http://{host}:{port}{SYNC_PATH}/*（客户端里只填 http://{host}:{port} 就行）")
     print(f"  日志：{os.path.join(data_dir, JOURNAL_NAME)}（journalId {journal.journal_id}）")
-    print(f"  管理：http://{args.host}:{port}{ADMIN_PATH} "
+    print(f"  管理：http://{host}:{port}{ADMIN_PATH} "
           + ("（已设置管理密码）" if admin.password_set() else "（首次打开会引导你设置管理密码）"))
     print(f"  授权：{'--token 已启用' if args.token else '由管理后台发放令牌'}，"
           f"当前 {len(admin.list_tokens())} 个令牌")
