@@ -1,4 +1,4 @@
-const API_BASE = '/admin/api';
+const API_BASE = '/api';
 
 const $ = (id) => document.getElementById(id);
 

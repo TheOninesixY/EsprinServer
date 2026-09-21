@@ -170,7 +170,12 @@ html.modern-layout .tabs-back:hover {
     background-color: var(--item-hover);
     color: var(--text-primary);
 }
-html.modern-layout .workspace:has(#editor-topbar:not(.hidden)) .tabs-back {
+/* 编辑器开着、并且按钮要站的那一格真有东西时才出现：
+   标签页开着时它钉在标签栏最左端，栏里一个标签都没有时那一行整条收起（见上面那条 :empty），
+   按钮也跟着一起不排；「禁用标签页」时它落在编辑器顶栏那一格上（标签栏整条不排，
+   标签仍留在 DOM 里），那一档只看编辑器开着没有。 */
+html.modern-layout:not(.tabs-disabled) .workspace:has(#editor-topbar:not(.hidden)):has(#workspace-tabs:not(:empty)) .tabs-back,
+html.modern-layout.tabs-disabled .workspace:has(#editor-topbar:not(.hidden)) .tabs-back {
     opacity: 1;
     transform: none;
     pointer-events: auto;

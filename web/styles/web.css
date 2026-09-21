@@ -158,33 +158,516 @@ html.modern-layout {
     line-height: 1.7;
 }
 
-/* 窄屏：中栏与设置面板依次收窄，编辑器始终保留 */
-@media (max-width: 900px) {
+/* ==========================================================================
+   移动端适配：平板与手机
+   三档递进，桌面端的取值一律不变：
+     1) ≤1180px（平板横屏）：三栏仍然并排，只是逐档收窄；
+     2) ≤860px（手机与竖屏平板）：三栏改成一栏一层——导航收成左侧抽屉，
+        列表占满整栏，打开条目时工作区整屏盖上，AI 助手与小本本同样整屏铺开；
+     3) 触摸设备（pointer: coarse）：放大点击目标，并把「悬停才出现」的操作改为常显。
+   抽屉的开关只切 <html> 上的 mobile-nav-open 类名，见 scripts/app.js。
+   ========================================================================== */
+
+/* 窄屏列表表头的两枚入口：桌面端不显示，搜索框照旧一行占满 */
+.notes-panel-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.notes-panel-bar .search-box {
+    flex: 1;
+    min-width: 0;
+}
+.notes-panel-menu,
+.notes-panel-new {
+    display: none;
+}
+
+/* 安全区：内容不钻进刘海与圆角屏的边角。
+   桌面浏览器里 env() 一律为 0，取值与桌面版逐条一致 */
+.app-container {
+    padding-top: env(safe-area-inset-top);
+    padding-right: env(safe-area-inset-right);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+}
+
+/* ---------------- 1. 平板：三栏并排，逐档收窄 ---------------- */
+@media (max-width: 1180px) {
+    .sidebar {
+        width: 190px;
+    }
     .notes-panel {
-        width: 220px;
+        width: 248px;
     }
     .settings-sidebar {
-        width: 150px;
+        width: 170px;
     }
     .settings-content {
-        padding: 20px 20px;
+        padding: 24px 28px;
     }
 }
 
-@media (max-width: 640px) {
-    .notes-panel {
-        width: 180px;
+/* ---------------- 2. 手机与竖屏平板：一栏一层 ---------------- */
+@media (max-width: 860px) {
+    /* 2.1 顶部工具按钮组：收成一行图标，下面各栏各自让出这一行 */
+    html.modern-layout .titlebar {
+        height: calc(44px + env(safe-area-inset-top));
+        padding-top: env(safe-area-inset-top);
+        padding-bottom: 2px;
+        align-items: flex-end;
     }
+    html.modern-layout .titlebar-actions {
+        height: auto;
+        gap: 2px;
+        padding-right: 4px;
+    }
+    html.modern-layout .titlebar-actions .btn-action-icon {
+        width: 32px;
+        height: 32px;
+    }
+    /* 同步状态在窄屏只留图标：文字挤不下，状态由图标与图标颜色表达 */
+    html.modern-layout .sync-chip {
+        width: 32px;
+        height: 32px;
+        padding: 0;
+        justify-content: center;
+    }
+    html.modern-layout #sync-chip-text {
+        display: none;
+    }
+    /* 经典布局的标题栏同样只留入口：标签栏收进笔记列表里 */
+    html:not(.modern-layout) .titlebar-tabs,
     .titlebar-title {
         display: none;
+    }
+
+    /* 2.2 导航改成左侧抽屉 */
+    .sidebar {
+        position: fixed;
+        top: 0;
+        bottom: 0;
+        left: 0;
+        width: 264px;
+        max-width: 82vw;
+        z-index: 330;
+        padding-top: env(safe-area-inset-top);
+        padding-bottom: env(safe-area-inset-bottom);
+        transform: translateX(-100%);
+        /* 收起时用一条全透明的阴影占位：抽屉整个滑出屏外后，投影的模糊范围
+           （约半个模糊半径）仍会压在屏幕左缘，留出一条没用的暗边。
+           打开时才显形，并让 box-shadow 跟着 transform 一起过渡 */
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0);
+        transition: transform var(--motion-slow) var(--ease-out),
+                    box-shadow var(--motion-slow) var(--ease-out);
+    }
+    html.mobile-nav-open .sidebar {
+        transform: none;
+        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28);
+    }
+    /* 抽屉之外的遮罩：点它收起（见 scripts/app.js 的点击处理） */
+    html.mobile-nav-open .app-body::after {
+        content: '';
+        position: fixed;
+        inset: 0;
+        z-index: 320;
+        background: rgba(0, 0, 0, 0.45);
+    }
+    /* 「收起侧边栏」只服务并排布局，抽屉里没有它的事 */
+    #btn-toggle-sidebar {
+        display: none;
+    }
+    /* 浮层菜单要盖在抽屉之上（抽屉 330，菜单与右键菜单默认 300） */
+    .dropdown-menu,
+    .context-menu {
+        z-index: 335;
+    }
+
+    /* 2.3 列表占满整栏 */
+    .notes-panel {
+        width: auto;
+        flex: 1;
+        min-width: 0;
+        border-right: none;
+    }
+    /* 标签栏整条收起：窄屏顶部留给悬浮按钮，多个条目改在列表里切换 */
+    html.modern-layout .workspace-tabs {
+        display: none;
+    }
+    /* 标签栏不再占位：那一行整行让给悬浮的工具按钮 */
+    html.modern-layout {
+        --modern-tabs-height: 0px;
+    }
+    html.modern-layout .notes-panel-header {
+        min-height: 0;
+        padding: 52px 10px 10px 10px;
+    }
+    .notes-panel-bar {
+        gap: 6px;
+    }
+    .notes-panel-menu,
+    .notes-panel-new {
+        display: inline-flex;
+        width: 36px;
+        height: 36px;
+        flex-shrink: 0;
+        border-radius: var(--radius-sm);
+        color: var(--text-secondary);
+        background: var(--item-hover);
+    }
+    .notes-panel-menu:active,
+    .notes-panel-new:active {
+        background: var(--item-active);
+        color: var(--text-primary);
+    }
+    .notes-list {
+        padding: 8px 10px calc(12px + env(safe-area-inset-bottom)) 10px;
+    }
+
+    /* 2.4 打开条目时，工作区整屏盖在列表上 */
+    .app-body > .workspace {
+        display: none;
+    }
+    .app-body > .workspace:has(#editor-topbar:not(.hidden)) {
+        display: flex;
+        position: fixed;
+        inset: 0;
+        z-index: 340;
+        padding-top: calc(44px + env(safe-area-inset-top));
+        padding-bottom: env(safe-area-inset-bottom);
+    }
+    /* 返回：各布局下都固定在左上角，与工具按钮同处一行 */
+    html .app-body .tabs-back {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        position: fixed;
+        top: calc(4px + env(safe-area-inset-top));
+        left: calc(4px + env(safe-area-inset-left));
+        width: 36px;
+        height: 36px;
+        margin: 0;
+        padding: 0;
+        border: 1px solid var(--border-color);
+        border-radius: var(--radius-sm);
+        background: var(--bg-titlebar);
+        color: var(--text-secondary);
+        opacity: 1;
+        transform: none;
+        pointer-events: auto;
+        z-index: 345;
+    }
+    html .app-body .tabs-back:active {
+        background: var(--item-active);
+        color: var(--text-primary);
+    }
+    /* 经典布局的标题栏在文档流里占着一行，工作区从它下面开始铺 */
+    html:not(.modern-layout) .app-body > .workspace:has(#editor-topbar:not(.hidden)) {
+        inset: calc(40px + env(safe-area-inset-top)) 0 env(safe-area-inset-bottom) 0;
+        padding-top: 0;
+        padding-bottom: 0;
+    }
+
+    /* 2.5 编辑器：各段收窄；正文到 16px（手机上 13.5px 偏小，
+       且 iOS 会在聚焦小于 16px 的输入框时把整页放大） */
+    .editor-topbar {
+        padding: 0 8px;
+        gap: 6px;
+    }
+    /* 视角切换与完成按钮不被压缩，可收缩的是左侧的文件夹与标签 */
+    .editor-actions {
+        flex-shrink: 0;
+    }
+    .select-folder {
+        max-width: 96px;
+    }
+    .view-btn {
+        padding: 2px 6px;
+    }
+    .editor-toolbar {
+        padding: 0 8px;
+    }
+    .editor-title-area {
+        padding: 12px 12px 6px 12px;
+    }
+    .editor-title-input {
+        font-size: 18px;
+    }
+    .editor-textarea,
+    .markdown-body {
+        font-size: 16px;
+    }
+    /* 分屏在窄屏改上下两段：左右各半会挤成两条 */
+    .editor-content-area {
+        flex-direction: column;
+    }
+    .editor-pane {
+        border-right: none;
+        border-bottom: 1px solid var(--border-light);
+    }
+    .editor-pane,
+    .preview-pane {
+        padding: 8px 12px 12px 12px;
+    }
+    .editor-footer {
+        padding: 0 10px;
+    }
+
+    /* 2.6 AI 助手：从右侧滑入并整屏铺开 */
+    .ai-panel,
+    .ai-panel.ai-collapsed {
+        position: fixed;
+        inset: 0;
+        width: auto;
+        border-left: none;
+        padding-top: env(safe-area-inset-top);
+        padding-bottom: env(safe-area-inset-bottom);
+        z-index: 360;
+        transform: translateX(100%);
+        transition: transform var(--motion-slow) var(--ease-out);
+    }
+    .ai-panel:not(.ai-collapsed) {
+        transform: none;
+    }
+    .ai-panel-header,
+    .ai-messages,
+    .ai-composer {
+        min-width: 0;
+    }
+    html.modern-layout .ai-panel-drag-strip {
+        height: 0;
+        margin-right: 0;
+    }
+    html.modern-layout .ai-drawer {
+        top: 40px;
+    }
+    .ai-input {
+        min-height: 76px;
+        font-size: 16px;
+    }
+    .ai-msg-body,
+    .ai-msg-body .markdown-body {
+        font-size: 15px;
+    }
+
+    /* 2.7 小本本：贴底铺开，宽度跟着屏幕走 */
+    .note-container {
+        left: calc(8px + env(safe-area-inset-left));
+        right: calc(8px + env(safe-area-inset-right));
+        bottom: calc(8px + env(safe-area-inset-bottom));
+        width: auto;
+        min-width: 0;
+        height: min(64vh, 460px);
+    }
+
+    /* 2.8 设置页：分类横排在上，内容整屏在下。
+       这一页自己就是整屏铺开的，右上角那组悬浮按钮会压住分类条，索性收起 */
+    html:has(#settings-view:not(.hidden)) #app-titlebar {
+        display: none;
+    }
+    .settings-view {
+        flex-direction: column;
+    }
+    .settings-sidebar {
+        width: 100%;
+        flex-shrink: 0;
+        border-right: none;
+        border-bottom: 1px solid var(--border-color);
+        padding: 6px 8px;
+        overflow-x: auto;
+        overflow-y: hidden;
+    }
+    .settings-nav {
+        flex-direction: row;
+        gap: 6px;
+    }
+    .settings-nav-item {
+        width: auto;
+        flex-shrink: 0;
+        white-space: nowrap;
+    }
+    html.modern-layout .settings-back,
+    html:not(.modern-layout) .settings-back {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        width: auto;
+        padding: 6px 8px;
+        margin-bottom: 6px;
+        border-radius: var(--radius-sm);
+        color: var(--text-secondary);
+        font-size: 12.5px;
+    }
+    html.modern-layout .settings-view .settings-content,
+    html.modern-layout body.is-fullscreen .settings-view .settings-content {
+        padding: 16px;
+        padding-top: 0;
+    }
+    html.modern-layout .settings-view .settings-header {
+        padding-top: 16px;
     }
     .settings-row {
         flex-direction: column;
         align-items: stretch;
+        padding: 12px;
     }
-    .settings-row .settings-select,
-    .settings-row .settings-input {
+    .settings-select,
+    .settings-input,
+    .accent-hex-input {
         min-width: 0;
+        width: 100%;
         max-width: none;
+        font-size: 16px;
+    }
+
+    /* 2.9 浮层：弹窗与提示条按屏宽铺开 */
+    .dialog-mask,
+    .gate-mask {
+        padding: 16px;
+        padding-top: calc(16px + env(safe-area-inset-top));
+        padding-bottom: calc(16px + env(safe-area-inset-bottom));
+    }
+    .dialog-box,
+    .gate-card {
+        max-width: none;
+    }
+    .toast-box {
+        left: 12px;
+        right: 12px;
+        bottom: calc(12px + env(safe-area-inset-bottom));
+        align-items: stretch;
+    }
+    .toast-item {
+        max-width: none;
+    }
+
+    /* 2.10 各滚动容器滚到两端时，不把整页带着一起滚 */
+    .notes-list,
+    .folder-list,
+    .tag-list,
+    .settings-sidebar,
+    .settings-content,
+    .ai-messages,
+    .ai-chat-list,
+    .preview-pane,
+    .editor-textarea {
+        overscroll-behavior: contain;
+    }
+}
+
+/* 动效偏好：导航抽屉不做滑动过渡，直接就位 */
+@media (max-width: 860px) and (prefers-reduced-motion: reduce) {
+    .sidebar {
+        transition: none !important;
+    }
+}
+
+/* ---------------- 3. 触摸设备：放大点击目标 ---------------- */
+@media (hover: none) and (pointer: coarse) {
+    /* 触摸没有悬停：点一下就停住的悬停态会留在屏幕上。
+       把「悬停才出现」的操作改为常显，反馈交给 :active */
+    .btn-del-folder,
+    .ai-chat-item-actions,
+    .ai-msg-actions {
+        opacity: 1;
+    }
+
+    .btn-action-icon,
+    .sidebar-bottom .btn-clear-trash,
+    .sidebar-bottom .btn-sidebar-bottom {
+        width: 36px;
+        height: 36px;
+    }
+    .titlebar-actions .btn-action-icon,
+    .ai-panel-header .btn-action-icon,
+    .note-titlebar .btn-action-icon {
+        width: 32px;
+        height: 32px;
+    }
+    .ai-chat-action {
+        width: 28px;
+        height: 28px;
+    }
+    /* 同步状态入口在桌面只有 26px 高，触摸设备上抬到 34px */
+    .sync-chip {
+        height: 34px;
+        padding: 0 12px;
+    }
+    .ai-send-btn,
+    .ai-drawer-new {
+        height: 32px;
+    }
+    .tab-item {
+        height: 34px;
+    }
+    .tab-close-btn {
+        width: 26px;
+        height: 26px;
+    }
+    .nav-item {
+        padding: 10px 10px;
+    }
+    .note-card {
+        padding: 12px;
+    }
+    .todo-check {
+        width: 26px;
+        height: 26px;
+    }
+    .fmt-btn {
+        width: 32px;
+        height: 32px;
+    }
+    .view-btn {
+        padding: 5px 10px;
+    }
+    .tag-pill {
+        padding: 4px 10px;
+    }
+    .context-menu-item,
+    .dropdown-option {
+        padding: 10px 12px;
+    }
+    .settings-btn {
+        height: 36px;
+        padding: 0 14px;
+        font-size: 13px;
+    }
+    .switch {
+        width: 48px;
+        height: 26px;
+    }
+    .switch .slider:before {
+        width: 20px;
+        height: 20px;
+    }
+    .switch input:checked + .slider:before {
+        transform: translateX(22px);
+    }
+    .accent-swatch {
+        width: 36px;
+        height: 36px;
+    }
+
+    /* 输入框一律 ≥16px：iOS 聚焦时不会把整页放大 */
+    .search-box input,
+    .select-folder,
+    .notes-panel-info select,
+    .ai-input,
+    .ai-scope-select,
+    .settings-input,
+    .settings-input.mono,
+    .settings-select,
+    .accent-hex-input,
+    .dialog-input,
+    .gate-input,
+    #scratchpad-title,
+    #scratchpad-content {
+        font-size: 16px;
+    }
+
+    /* 触摸设备上按压反馈必须立刻可见，这里去掉点击时浏览器补的灰色高亮块 */
+    html {
+        -webkit-tap-highlight-color: transparent;
     }
 }

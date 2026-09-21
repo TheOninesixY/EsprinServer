@@ -25,13 +25,15 @@ JOURNAL_ID_NAME = "journal.id"
 ADMIN_FILE_NAME = "admin.json"
 TOKENS_FILE_NAME = "tokens.json"
 ADMIN_COOKIE_NAME = "esprin_admin"
-ADMIN_PATH = "/admin"
+# 同步接口挂在 /sync 下；管理页与其接口挂在根路径下
 SYNC_PATH = "/sync"
-# 网页版入口：根路径返回该页面，页面静态资源挂在下面这两组前缀下
+API_PREFIX = "/api"
 HEALTH_PATH = "/health"
-WEB_INDEX_PATH = "/index.html"
-WEB_ASSET_PREFIXES = ("/styles/", "/scripts/")
-WEB_FAVICON_PATH = "/favicon.png"
+# 管理页在根路径：/ 返回页面，页面静态资源（样式、脚本、图标、字体）也从根路径取
+MANAGER_ASSET_PATHS = ("/app.css", "/app.js", "/favicon.png")
+MANAGER_ASSET_PREFIXES = ("/fonts/",)
+# 旧地址：管理页原先在 /admin，这里只留一次跳转，免得旧书签打不开
+LEGACY_ADMIN_PATH = "/admin"
 PBKDF2_ITERATIONS = 200_000
 PBKDF2_SALT_BYTES = 16
 SESSION_TTL_SECONDS = 12 * 60 * 60
@@ -467,8 +469,6 @@ class Journal:
 
 MANAGER_DIR_NAME = "manager"
 MANAGER_INDEX_NAME = "index.html"
-WEB_DIR_NAME = "web"
-WEB_INDEX_NAME = "index.html"
 ASSET_CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -489,37 +489,13 @@ MISSING_PAGE_HTML = """<!DOCTYPE html>
 <h1 style="font-size:18px;margin-bottom:12px">找不到管理页面</h1>
 <p style="color:#8b949e">服务端期望在下面这个位置读到 index.html：</p>
 <p><code style="background:#21262d;padding:6px 10px;border-radius:6px;display:inline-block">{path}</code></p>
-<p style="color:#8b949e">把仓库里的 manager/ 目录（index.html、app.css、app.js）放到服务端脚本旁边，再刷新本页。</p>
-</body></html>
-"""
-
-
-MISSING_WEB_PAGE_HTML = """<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><title>找不到网页版</title></head>
-<body style="font:14px/1.7 -apple-system,'Segoe UI','Microsoft YaHei',sans-serif;padding:40px;background:#0d1117;color:#f0f6fc">
-<h1 style="font-size:18px;margin-bottom:12px">找不到网页版</h1>
-<p style="color:#8b949e">服务端期望在下面这个位置读到 index.html：</p>
-<p><code style="background:#21262d;padding:6px 10px;border-radius:6px;display:inline-block">{path}</code></p>
-<p style="color:#8b949e">把仓库里的 web/ 目录（index.html、styles/、scripts/）放到服务端脚本旁边，再刷新本页。</p>
+<p style="color:#8b949e">把仓库里的 manager/ 目录（index.html、app.css、app.js、fonts/）放到服务端脚本旁边，再刷新本页。</p>
 </body></html>
 """
 
 
 def manager_dir():
     return os.path.join(SCRIPT_DIR, MANAGER_DIR_NAME)
-
-
-def web_dir():
-    return os.path.join(SCRIPT_DIR, WEB_DIR_NAME)
-
-
-def read_web_index():
-    path = os.path.join(web_dir(), WEB_INDEX_NAME)
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return handle.read()
-    except OSError:
-        return MISSING_WEB_PAGE_HTML.replace("{path}", path)
 
 
 def read_manager_index():
@@ -611,10 +587,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                    extra_headers={"Cache-Control": "no-store"})
 
     def _send_manager_asset(self, path):
-        self._send_static_asset(manager_dir(), path[len(ADMIN_PATH):], MANAGER_INDEX_NAME)
-
-    def _send_web_asset(self, path):
-        self._send_static_asset(web_dir(), path, WEB_INDEX_NAME)
+        self._send_static_asset(manager_dir(), path, MANAGER_INDEX_NAME)
 
     def _authorize_api(self):
         header = self.headers.get("Authorization", "")
@@ -631,12 +604,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return None, "该令牌已在管理后台停用"
             return record, ""
 
-        # 同源网页版：只认管理后台的登录会话（网页版由本服务端托管，用同一份静默会话）。
+        # 同源请求：认管理后台的登录会话（就在本服务端登录，同源页面可直接读写同步接口）。
         # 未配置任何凭据时不再放行：读写一律要求管理密码会话或访问令牌
         if self._is_same_origin() and self._has_session():
-            return {"id": "", "name": "网页版会话", "device": "", "builtin": False}, ""
+            return {"id": "", "name": "管理后台会话", "device": "", "builtin": False}, ""
 
-        return None, "缺少凭据（网页版请先登录管理后台，客户端请在设置里填写访问令牌）"
+        return None, "缺少凭据（请先登录管理后台，客户端请在设置里填写访问令牌）"
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -660,7 +633,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "latestSeq": self.journal.latest_seq,
                 "authRequired": True,
                 "syncPath": SYNC_PATH,
-                "adminPath": ADMIN_PATH,
+                "adminPath": "/",
             })
             return
 
@@ -669,39 +642,33 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION,
-                "webPath": "/",
                 "syncPath": SYNC_PATH,
-                "adminPath": ADMIN_PATH,
-                # 网页版据此选择登录方式：已设密码走密码登录，否则填写访问令牌
+                "adminPath": "/",
+                "apiPath": API_PREFIX,
                 "passwordSet": self.admin.password_set(),
                 "tokenCount": len(self.admin.list_tokens()),
                 "authRequired": True,
             })
             return
 
-        # 网页版：根路径返回应用页面，页面资源按前缀从 web/ 目录取
-        if parsed.path == "/" or parsed.path == WEB_INDEX_PATH:
-            page = read_web_index()
-            self._send(200, raw=page.encode("utf-8"), content_type="text/html; charset=utf-8",
-                       extra_headers={"Cache-Control": "no-store"})
-            return
-
-        if parsed.path.startswith(WEB_ASSET_PREFIXES) or parsed.path == WEB_FAVICON_PATH:
-            self._send_web_asset(parsed.path)
-            return
-
-        if parsed.path == ADMIN_PATH or parsed.path == ADMIN_PATH + "/":
+        # 管理页：根路径返回页面，页面资源（样式、脚本、图标、字体）也从 manager/ 目录按根路径取
+        if parsed.path in ("/", "/index.html"):
             page = read_manager_index()
             self._send(200, raw=page.encode("utf-8"), content_type="text/html; charset=utf-8",
                        extra_headers={"Cache-Control": "no-store"})
             return
 
-        if parsed.path.startswith(ADMIN_PATH + "/api/"):
-            self._handle_admin_get(parsed.path)
+        if parsed.path in MANAGER_ASSET_PATHS or parsed.path.startswith(MANAGER_ASSET_PREFIXES):
+            self._send_manager_asset(parsed.path)
             return
 
-        if parsed.path.startswith(ADMIN_PATH + "/"):
-            self._send_manager_asset(parsed.path)
+        # 管理页原先挂在 /admin：页面与接口都已挪到根路径，这里只做一次跳转
+        if parsed.path in (LEGACY_ADMIN_PATH, LEGACY_ADMIN_PATH + "/"):
+            self._send(302, raw=b"", extra_headers={"Location": "/"})
+            return
+
+        if parsed.path.startswith(API_PREFIX + "/"):
+            self._handle_admin_get(parsed.path)
             return
 
         record, error = self._authorize_api()
@@ -752,7 +719,7 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path.startswith(ADMIN_PATH + "/api/"):
+        if parsed.path.startswith(API_PREFIX + "/"):
             payload = self._read_json() or {}
             self._handle_admin_post(parsed.path, payload)
             return
@@ -793,7 +760,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._send(404, {"ok": False, "error": "未知接口"})
 
     def _handle_admin_get(self, path):
-        if path == ADMIN_PATH + "/api/status":
+        if path == API_PREFIX + "/status":
             self._send(200, {
                 "ok": True,
                 "version": SERVER_VERSION,
@@ -807,14 +774,14 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send(401, {"ok": False, "error": "请先登录管理后台"})
             return
 
-        if path == ADMIN_PATH + "/api/tokens":
+        if path == API_PREFIX + "/tokens":
             self._send(200, {"ok": True, "tokens": self.admin.list_tokens()})
             return
 
         self._send(404, {"ok": False, "error": "未知接口"})
 
     def _handle_admin_post(self, path, payload):
-        if path == ADMIN_PATH + "/api/setup-password":
+        if path == API_PREFIX + "/setup-password":
             password = str(payload.get("password") or "")
             if len(password) < MIN_PASSWORD_LENGTH:
                 self._send(400, {"ok": False, "error": "密码至少 {} 位".format(MIN_PASSWORD_LENGTH)})
@@ -826,7 +793,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True}, extra_headers={"Set-Cookie": self._session_cookie(session_id)})
             return
 
-        if path == ADMIN_PATH + "/api/login":
+        if path == API_PREFIX + "/login":
             ip = self._client_ip()
             if not self.admin.login_allowed(ip):
                 self._send(429, {"ok": False, "error": "尝试次数过多，请稍后再试"})
@@ -843,12 +810,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send(401, {"ok": False, "error": "请先登录管理后台"})
             return
 
-        if path == ADMIN_PATH + "/api/logout":
+        if path == API_PREFIX + "/logout":
             self.admin.destroy_session(self._session_id())
             self._send(200, {"ok": True}, extra_headers={"Set-Cookie": self._expired_cookie()})
             return
 
-        if path == ADMIN_PATH + "/api/password":
+        if path == API_PREFIX + "/password":
             new_password = str(payload.get("newPassword") or "")
             if len(new_password) < MIN_PASSWORD_LENGTH:
                 self._send(400, {"ok": False, "error": "新密码至少 {} 位".format(MIN_PASSWORD_LENGTH)})
@@ -860,7 +827,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True}, extra_headers={"Set-Cookie": self._session_cookie(session_id)})
             return
 
-        if path == ADMIN_PATH + "/api/tokens":
+        if path == API_PREFIX + "/tokens":
             token_id, token = self.admin.create_token(payload.get("name"), payload.get("device"))
             self._send(200, {
                 "ok": True,
@@ -870,7 +837,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             })
             return
 
-        if path == ADMIN_PATH + "/api/tokens/rotate":
+        if path == API_PREFIX + "/tokens/rotate":
             token = self.admin.rotate_token(str(payload.get("id") or ""))
             if not token:
                 self._send(404, {"ok": False, "error": "找不到该令牌"})
@@ -878,7 +845,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "token": token, "tokens": self.admin.list_tokens()})
             return
 
-        if path == ADMIN_PATH + "/api/tokens/update":
+        if path == API_PREFIX + "/tokens/update":
             record = self.admin.update_token(
                 str(payload.get("id") or ""), payload.get("name"), payload.get("device"), payload.get("enabled"))
             if not record:
@@ -887,7 +854,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "tokens": self.admin.list_tokens()})
             return
 
-        if path == ADMIN_PATH + "/api/tokens/delete":
+        if path == API_PREFIX + "/tokens/delete":
             if not self.admin.delete_token(str(payload.get("id") or "")):
                 self._send(404, {"ok": False, "error": "找不到该令牌"})
                 return
@@ -1044,67 +1011,66 @@ def selftest():
         check("越界路径被拒绝", body["ok"] is False and "路径不合法" in body.get("error", ""), repr(body))
 
         log("INFO", "Selftest", "section=admin")
-        status, page = get(ADMIN_PATH, token=None)
-        check("管理页面可直接打开", status == 200 and "<!DOCTYPE html>" in page.get("_raw", ""), repr(page)[:160])
+        status, page = get("/", token=None)
+        check("根路径返回管理页面", status == 200 and "<!DOCTYPE html>" in page.get("_raw", ""), repr(page)[:160])
 
-        status, css = get(ADMIN_PATH + "/app.css", token=None)
-        check("管理页静态资源可直接取用", status == 200 and "--bg-body" in css.get("_raw", ""), repr(css)[:80])
+        status, page = get("/index.html", token=None)
+        check("管理页也能按 /index.html 打开", status == 200 and "EsprinServer" in page.get("_raw", ""), repr(page)[:160])
 
-        status, body = get(ADMIN_PATH + "/app.js", token=None)
+        status, css = get("/app.css", token=None)
+        check("管理页样式可直接取用", status == 200 and "--bg-body" in css.get("_raw", ""), repr(css)[:80])
+
+        status, body = get("/app.js", token=None)
         check("管理页脚本可直接取用", status == 200 and "API_BASE" in body.get("_raw", ""), repr(body)[:80])
 
-        status, body = get(ADMIN_PATH + "/%2e%2e/%2e%2e/EsprinServer.py", token=None)
+        check("管理页字体随包提供",
+              os.path.isfile(os.path.join(manager_dir(), "fonts", "Mohave-VariableFont_wght.ttf")), manager_dir())
+        status, body = get("/fonts/nope.ttf", token=None)
+        check("字体目录里没有的文件返回 404", status == 404, repr(body))
+
+        status, body = get("/fonts/../../EsprinServer.py", token=None)
         check("静态资源不允许穿越出 manager 目录", status == 404, repr(body))
 
-        log("INFO", "Selftest", "section=web-app")
-        status, page = get("/", token=None)
-        check("根路径返回网页版页面", status == 200 and "<!DOCTYPE html>" in page.get("_raw", ""), repr(page)[:160])
-        status, page = get(WEB_INDEX_PATH, token=None)
-        check("网页版页面可直接打开", status == 200 and "EsprinNemo" in page.get("_raw", ""), repr(page)[:160])
+        status, page = get(LEGACY_ADMIN_PATH, token=None)
+        check("旧地址 /admin 仍然落到管理页", status == 200 and "<!DOCTYPE html>" in page.get("_raw", ""), repr(page)[:160])
 
-        status, css = get("/styles/tokens.css", token=None)
-        check("网页版样式可直接取用", status == 200 and "--bg-body" in css.get("_raw", ""), repr(css)[:80])
-
-        status, body = get("/scripts/store.js", token=None)
-        check("网页版脚本可直接取用", status == 200 and "FileStore" in body.get("_raw", ""), repr(body)[:80])
-
-        status, body = get("/styles/../../EsprinServer.py", token=None)
-        check("网页版资源不允许穿越出 web 目录", status == 404, repr(body))
+        status, body = get("/styles/tokens.css")
+        check("网页版资源不再对外提供", status == 404, repr(body))
 
         status, body = get(HEALTH_PATH, token=None)
-        check("health 告知网页版入口与凭据状态",
-              status == 200 and body.get("webPath") == "/" and body.get("passwordSet") is False
-              and body.get("authRequired") is True, repr(body))
+        check("health 告知管理页入口与凭据状态",
+              status == 200 and body.get("adminPath") == "/" and body.get("apiPath") == API_PREFIX
+              and body.get("passwordSet") is False and body.get("authRequired") is True, repr(body))
 
         status, body = get(sync + "/state", token=None)
         check("未登录的同源请求仍然 401", status == 401, repr(body))
 
-        status, body = get(ADMIN_PATH + "/api/status", token=None)
+        status, body = get(API_PREFIX + "/status", token=None)
         check("初始状态：未设密码、未登录", status == 200 and body.get("passwordSet") is False and body.get("loggedIn") is False, repr(body))
 
-        status, body = get(ADMIN_PATH + "/api/tokens", token=None)
+        status, body = get(API_PREFIX + "/tokens", token=None)
         check("未登录不能看令牌", status == 401, repr(body))
 
-        status, body = post(ADMIN_PATH + "/api/setup-password", {"password": "123"}, token=None, cookie=True)
+        status, body = post(API_PREFIX + "/setup-password", {"password": "123"}, token=None, cookie=True)
         check("密码太短被拒绝", status == 400, repr(body))
 
-        status, body = post(ADMIN_PATH + "/api/setup-password", {"password": "admin-pass-1"}, token=None, cookie=True)
+        status, body = post(API_PREFIX + "/setup-password", {"password": "admin-pass-1"}, token=None, cookie=True)
         check("首次设置密码并自动登录", status == 200 and ADMIN_COOKIE_NAME in cookies, repr(body))
 
-        status, body = post(ADMIN_PATH + "/api/setup-password", {"password": "another-pass"}, token=None)
+        status, body = post(API_PREFIX + "/setup-password", {"password": "another-pass"}, token=None)
         check("密码只能设置一次", status == 400, repr(body))
 
-        status, body = get(ADMIN_PATH + "/api/tokens", token=None, cookie=True)
+        status, body = get(API_PREFIX + "/tokens", token=None, cookie=True)
         check("登录后可以看令牌列表", status == 200 and body.get("tokens") == [], repr(body))
 
         status, body = get(sync + "/state", token=None, cookie=True)
-        check("同源网页版持登录态可读同步接口", status == 200 and "files" in body, repr(body)[:120])
+        check("同源管理后台持登录态可读同步接口", status == 200 and "files" in body, repr(body)[:120])
         status, body = get(sync + "/state", token=None, cookie=True, origin="https://evil.example")
         check("跨站请求带登录态也不放行", status == 401, repr(body))
         status, body = get(HEALTH_PATH, token=None)
         check("设过密码后 health 标明需要鉴权", body.get("passwordSet") is True, repr(body))
 
-        status, body = post(ADMIN_PATH + "/api/tokens", {"name": "台式机", "device": "dev-bound"}, token=None, cookie=True)
+        status, body = post(API_PREFIX + "/tokens", {"name": "台式机", "device": "dev-bound"}, token=None, cookie=True)
         token_a = body.get("token", "")
         check("创建令牌并返回一次明文", status == 200 and token_a.startswith("esn_") and len(body["tokens"]) == 1, repr(body)[:160])
         check("列表里不带摘要", "digest" not in body["tokens"][0], repr(body["tokens"][0]))
@@ -1121,48 +1087,48 @@ def selftest():
         status, body = get(sync + "/ops?since=3", token=token_a)
         check("令牌绑定的设备优先于客户端自报", body["ops"][0]["device"] == "dev-bound", repr(body["ops"][0]))
 
-        status, body = get(ADMIN_PATH + "/api/tokens", token=None, cookie=True)
+        status, body = get(API_PREFIX + "/tokens", token=None, cookie=True)
         check("记下了最近的设备", body["tokens"][0].get("lastDeviceId") == "dev-lying" and body["tokens"][0].get("lastUsedAt", 0) > 0, repr(body["tokens"][0]))
         token_id = body["tokens"][0]["id"]
 
-        status, body = post(ADMIN_PATH + "/api/tokens/update", {"id": token_id, "name": "笔记本", "device": "dev-new"}, token=None, cookie=True)
+        status, body = post(API_PREFIX + "/tokens/update", {"id": token_id, "name": "笔记本", "device": "dev-new"}, token=None, cookie=True)
         check("修改名称与设备", status == 200 and body["tokens"][0]["name"] == "笔记本" and body["tokens"][0]["device"] == "dev-new", repr(body)[:160])
 
-        status, body = post(ADMIN_PATH + "/api/tokens/update", {"id": token_id, "enabled": False}, token=None, cookie=True)
+        status, body = post(API_PREFIX + "/tokens/update", {"id": token_id, "enabled": False}, token=None, cookie=True)
         status2, body2 = get(sync + "/ops?since=0", token=token_a)
         check("停用后令牌立刻失效", status == 200 and status2 == 401 and "停用" in body2.get("error", ""), repr(body2))
 
-        status, body = post(ADMIN_PATH + "/api/tokens/rotate", {"id": token_id}, token=None, cookie=True)
+        status, body = post(API_PREFIX + "/tokens/rotate", {"id": token_id}, token=None, cookie=True)
         token_b = body.get("token", "")
         status2, _ = get(sync + "/ops?since=0", token=token_a)
         status3, _ = get(sync + "/ops?since=0", token=token_b)
         check("重置后旧令牌失效、新令牌可用", status == 200 and status2 == 401 and status3 == 200 and token_b != token_a, f"{status}/{status2}/{status3}")
 
-        status, body = post(ADMIN_PATH + "/api/login", {"password": "wrong-pass"}, token=None)
+        status, body = post(API_PREFIX + "/login", {"password": "wrong-pass"}, token=None)
         check("密码错误不能登录", status == 401, repr(body))
 
         old_cookie = cookies[ADMIN_COOKIE_NAME]
-        status, body = post(ADMIN_PATH + "/api/password", {"oldPassword": "nope", "newPassword": "new-pass-12"}, token=None, cookie=True)
+        status, body = post(API_PREFIX + "/password", {"oldPassword": "nope", "newPassword": "new-pass-12"}, token=None, cookie=True)
         check("当前密码不对时拒绝改密码", status == 400, repr(body))
 
-        status, body = post(ADMIN_PATH + "/api/password", {"oldPassword": "admin-pass-1", "newPassword": "new-pass-12"}, token=None, cookie=True)
+        status, body = post(API_PREFIX + "/password", {"oldPassword": "admin-pass-1", "newPassword": "new-pass-12"}, token=None, cookie=True)
         check("改密码成功并换发会话", status == 200 and cookies[ADMIN_COOKIE_NAME] != old_cookie, repr(body))
 
         current_cookie = cookies[ADMIN_COOKIE_NAME]
         cookies[ADMIN_COOKIE_NAME] = old_cookie
-        status, body = get(ADMIN_PATH + "/api/tokens", token=None, cookie=True)
+        status, body = get(API_PREFIX + "/tokens", token=None, cookie=True)
         check("改密码后旧会话失效", status == 401, repr(body))
         cookies[ADMIN_COOKIE_NAME] = current_cookie
 
-        status, body = post(ADMIN_PATH + "/api/login", {"password": "new-pass-12"}, token=None, cookie=True)
+        status, body = post(API_PREFIX + "/login", {"password": "new-pass-12"}, token=None, cookie=True)
         check("新密码可以登录", status == 200, repr(body))
 
-        status, body = post(ADMIN_PATH + "/api/tokens/delete", {"id": token_id}, token=None, cookie=True)
+        status, body = post(API_PREFIX + "/tokens/delete", {"id": token_id}, token=None, cookie=True)
         status2, _ = get(sync + "/ops?since=0", token=token_b)
         check("删除令牌后立即失效", status == 200 and status2 == 401, f"{status}/{status2}")
 
-        status, body = post(ADMIN_PATH + "/api/logout", {}, token=None, cookie=True)
-        status2, _ = get(ADMIN_PATH + "/api/tokens", token=None, cookie=True)
+        status, body = post(API_PREFIX + "/logout", {}, token=None, cookie=True)
+        status2, _ = get(API_PREFIX + "/tokens", token=None, cookie=True)
         check("退出登录后会话失效", status == 200 and status2 == 401, f"{status}/{status2}")
 
         check("启动参数 --token 仍然可用", get(sync + "/ops?since=0")[0] == 200)
@@ -1307,10 +1273,10 @@ def main(argv=None):
     log("INFO", "Sync", "endpoint={}/* origin=http://{}:{}".format(SYNC_PATH, url_host, bound_port))
     log("INFO", "Storage", "journal={} journalId={} ops={} latestSeq={}".format(
         os.path.join(data_dir, JOURNAL_NAME), journal.journal_id, journal.count, journal.latest_seq))
-    log("INFO", "Admin", "endpoint={} passwordSet={}".format(ADMIN_PATH, admin.password_set()))
+    log("INFO", "Admin", "endpoint=/ pageAssets=/* api={} passwordSet={}".format(API_PREFIX, admin.password_set()))
     log("INFO", "Auth", "tokenSource={} tokenCount={}".format("--token" if args.token else "admin", len(admin.list_tokens())))
     if not admin.password_set() and not admin.list_tokens() and not args.token:
-        log("WARN", "Auth", "未配置任何凭据：同步接口一律返回 401 (action={} 设置管理密码或创建访问令牌)".format(ADMIN_PATH))
+        log("WARN", "Auth", "未配置任何凭据：同步接口一律返回 401 (action=打开管理页 / 设置管理密码或创建访问令牌)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

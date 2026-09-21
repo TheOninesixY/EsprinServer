@@ -1,7 +1,7 @@
 @font-face {
     font-family: 'Mohave';
-    src: url('/admin/fonts/Mohave-VariableFont_wght.ttf') format('truetype-variations'),
-         url('/admin/fonts/Mohave-VariableFont_wght.ttf') format('truetype');
+    src: url('/fonts/Mohave-VariableFont_wght.ttf') format('truetype-variations'),
+         url('/fonts/Mohave-VariableFont_wght.ttf') format('truetype');
     font-weight: 300 700;
     font-style: normal;
     font-display: swap;

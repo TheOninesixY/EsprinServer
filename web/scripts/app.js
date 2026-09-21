@@ -3,6 +3,8 @@
 let sidebarFadeTimer = null;
 let searchDebounce = null;
 const systemThemeQuery = window.matchMedia('(prefers-color-scheme: light)');
+// 窄屏（手机与竖屏平板）：导航改成抽屉、列表与工作区各占一屏，见 styles/web.css
+const narrowScreenQuery = window.matchMedia('(max-width: 860px)');
 
 /* ---------------- 换肤交叉淡入 ----------------
    与 styles/motion.css 的 html.appearance-fading 配对：先挂类、强制刷一次样式，
@@ -174,12 +176,17 @@ function setBrandColor(value) {
 
 /* ---------------- 侧边栏收起 / 展开 ---------------- */
 
+function isNarrowScreen() {
+    return narrowScreenQuery.matches;
+}
+
 function applySidebarCollapsed(animate = false) {
     const html = document.documentElement;
     const sidebar = document.getElementById('app-sidebar');
     const icon = document.getElementById('sidebar-toggle-icon');
     const toggle = document.getElementById('btn-toggle-sidebar');
-    const collapsed = !!State.sidebarCollapsed;
+    // 窄屏下侧边栏是一条抽屉（见 styles/web.css），不再参与「收起 / 展开」这一对形态
+    const collapsed = !!State.sidebarCollapsed && !isNarrowScreen();
 
     const finish = () => {
         html.classList.toggle('sidebar-collapsed', collapsed);
@@ -211,6 +218,40 @@ function toggleSidebarCollapsed() {
     State.sidebarCollapsed = !State.sidebarCollapsed;
     applySidebarCollapsed(true);
     saveConfig();
+}
+
+/* ---------------- 窄屏：导航抽屉 ----------------
+   窄屏下侧边栏整条挪到屏幕之外（见 styles/web.css），由笔记列表表头的菜单键拉开。
+   这里只切 <html> 上的 mobile-nav-open 类名，外加两处「点完就该收起」的时机：
+   点抽屉之外的任何地方，以及转屏／改窗口宽度换到另一档。 */
+
+function applyMobileNav(open) {
+    document.documentElement.classList.toggle('mobile-nav-open', !!open && isNarrowScreen());
+}
+
+function closeMobileNav() {
+    applyMobileNav(false);
+}
+
+function toggleMobileNav() {
+    applyMobileNav(!document.documentElement.classList.contains('mobile-nav-open'));
+}
+
+function bindMobileNav() {
+    const menu = document.getElementById('btn-mobile-nav');
+    if (menu) menu.onclick = toggleMobileNav;
+
+    document.addEventListener('click', (event) => {
+        if (!document.documentElement.classList.contains('mobile-nav-open')) return;
+        // 「新建」自己负责展开菜单：这一下先不收起抽屉，等从菜单里选完再收
+        if (event.target.closest('#btn-mobile-nav') || event.target.closest('#btn-new-note')) return;
+        closeMobileNav();
+    });
+
+    narrowScreenQuery.addEventListener('change', () => {
+        closeMobileNav();
+        applySidebarCollapsed(false);
+    });
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -257,10 +298,14 @@ function bindEvents() {
     };
     document.getElementById('btn-new-note').onclick = toggleNewItemMenuAt;
     document.getElementById('btn-empty-new').onclick = toggleNewItemMenuAt;
+    // 窄屏的表头新建入口与上面两处共用同一套菜单
+    const mobileNew = document.getElementById('btn-mobile-new');
+    if (mobileNew) mobileNew.onclick = toggleNewItemMenuAt;
     document.getElementById('btn-add-folder').onclick = addFolder;
     document.getElementById('btn-empty-trash').onclick = clearTrash;
     document.getElementById('btn-open-settings').onclick = openSettingsTab;
     document.getElementById('btn-toggle-sidebar').onclick = toggleSidebarCollapsed;
+    bindMobileNav();
 
     // 中栏
     const searchInput = document.getElementById('input-search');
@@ -306,7 +351,7 @@ function bindEvents() {
     document.addEventListener('click', (event) => {
         // 「新建」按钮自己负责展开 / 收起菜单，这里要跳过它们，
         // 否则菜单刚被展开就会随这次点击冒泡到 document 时立刻收起
-        if (event.target.closest('#btn-new-note') || event.target.closest('#btn-empty-new')) return;
+        if (event.target.closest('#btn-new-note') || event.target.closest('#btn-empty-new') || event.target.closest('#btn-mobile-new')) return;
         if (!event.target.closest('#context-menu')) hideContextMenu();
     });
     document.addEventListener('contextmenu', (event) => {
@@ -348,6 +393,11 @@ function handleGlobalKeydown(event) {
         }
         // 连接层是模态的：没有凭据就不能进入界面，按 Esc 也不关闭
         if (!document.getElementById('gate-mask').classList.contains('hidden')) return;
+        // 窄屏的导航抽屉：这一层在最上面，先收它
+        if (document.documentElement.classList.contains('mobile-nav-open')) {
+            closeMobileNav();
+            return;
+        }
         if (!document.getElementById('context-menu').classList.contains('hidden')) {
             hideContextMenu();
             return;
@@ -423,6 +473,11 @@ function handleGlobalKeydown(event) {
 function toggleFullscreen() {
     if (document.fullscreenElement) {
         document.exitFullscreen();
+        return;
+    }
+    // iOS Safari 至今没有全屏 API：先探一下，别把一次点击变成未捕获的异常
+    if (typeof document.documentElement.requestFullscreen !== 'function') {
+        showToast('当前浏览器不支持全屏，可用「添加到主屏幕」后从桌面图标启动');
         return;
     }
     document.documentElement.requestFullscreen().catch((error) => {

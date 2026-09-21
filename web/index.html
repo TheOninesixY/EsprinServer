@@ -2,7 +2,12 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<!-- viewport-fit=cover：页面铺到刘海屏 / 圆角屏边缘，安全区由 styles/web.css 用 env() 让开。
+     apple-mobile-web-app-capable：iOS 上「添加到主屏幕」后按独立应用全屏运行 -->
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="EsprinNemo">
 <title>EsprinNemo</title>
 <!-- 图标字形：Material Symbols Rounded。离线部署时可把 npm 包 material-symbols 里的
      rounded.css 与字体文件放到 fonts/material-symbols/，再把这一行的 href 换成本地路径 -->
@@ -139,10 +144,20 @@
         <!-- 中栏列表 -->
         <section class="notes-panel">
             <div class="notes-panel-header">
-                <div class="search-box">
-                    <span class="ms-icon sm" style="color: var(--text-muted);">search</span>
-                    <input type="text" id="input-search" placeholder="搜索笔记... (Ctrl+K)" spellcheck="false">
-                    <span class="ms-icon xs btn-clear hidden" id="btn-search-clear">close</span>
+                <!-- 窄屏的两枚入口：左侧菜单（拉开导航抽屉）、右侧新建。
+                     桌面端这两枚不显示，搜索框照旧一行占满（见 styles/web.css） -->
+                <div class="notes-panel-bar">
+                    <button class="btn-action-icon notes-panel-menu" id="btn-mobile-nav" type="button" title="导航">
+                        <span class="ms-icon sm">menu</span>
+                    </button>
+                    <div class="search-box">
+                        <span class="ms-icon sm" style="color: var(--text-muted);">search</span>
+                        <input type="text" id="input-search" placeholder="搜索笔记... (Ctrl+K)" spellcheck="false">
+                        <span class="ms-icon xs btn-clear hidden" id="btn-search-clear">close</span>
+                    </div>
+                    <button class="btn-action-icon notes-panel-new" id="btn-mobile-new" type="button" title="新建笔记或待办">
+                        <span class="ms-icon sm">add</span>
+                    </button>
                 </div>
                 <div class="notes-panel-info">
                     <span id="panel-category-title">全部笔记</span>

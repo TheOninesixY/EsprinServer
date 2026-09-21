@@ -44,6 +44,16 @@ function isModernLayout() {
     return State.uiMode === 'modern';
 }
 
+// 窄屏判定：与 styles/web.css 的断点、scripts/app.js 的 narrowScreenQuery 一致。
+// 这里在样式表生效前跑一次，只做静态判断，转屏之后由 scripts/app.js 接手
+function bootNarrowScreen() {
+    try {
+        return window.matchMedia('(max-width: 860px)').matches;
+    } catch (error) {
+        return false;
+    }
+}
+
 /* ---------------- 主题色的亮度换算 ----------------
    强调色底面上的文字色按相对亮度取黑或白（浅色主题色上不会出现白字看不清），
    与 scripts/app.js 的 accentForeground 同一套算法 */
@@ -101,8 +111,9 @@ function quoteFontFamily(name) {
     root.classList.toggle(MODERN_LAYOUT_CLASS, uiMode === 'modern');
     root.classList.toggle(TABS_DISABLED_CLASS, uiMode === 'modern' && !!stored.tabsDisabled);
 
-    // 侧边栏收起态：首屏按收起态绘制，不出现展开后补播动画
-    root.classList.toggle(SIDEBAR_COLLAPSED_CLASS, !!stored.sidebarCollapsed);
+    // 侧边栏收起态：首屏按收起态绘制，不出现展开后补播动画。
+    // 窄屏下侧边栏是一条抽屉（见 styles/web.css），这一对形态不适用
+    root.classList.toggle(SIDEBAR_COLLAPSED_CLASS, !!stored.sidebarCollapsed && !bootNarrowScreen());
 
     // 主题色：写在内联样式上，高于 tokens.css 里的默认值
     const accent = normalizeAccentHex(stored.accentColor);
