@@ -48,6 +48,12 @@ def sha256_text(text):
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def log(level, component, message):
+    stream = sys.stderr if level in ("WARN", "ERROR") else sys.stdout
+    stream.write("[{}] [{}] {}\n".format(level, component, message))
+    stream.flush()
+
+
 def normalize_relative_path(value):
     text = str(value or "").strip().replace("\\", "/")
     if not text:
@@ -132,7 +138,7 @@ class AdminStore:
                 json.dump(value, handle, ensure_ascii=False, indent=2)
             os.replace(temp, path)
         except OSError as error:
-            sys.stderr.write("[admin] 写入 {} 失败：{}\n".format(path, error))
+            log("ERROR", "Admin", "写入失败: {} (path={})".format(error, path))
 
     def password_set(self):
         return bool(self.password_hash)
@@ -503,7 +509,7 @@ class ApiHandler(BaseHTTPRequestHandler):
     token = ""
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+        log("INFO", "HTTP", "{} {}".format(self.log_date_time_string(), fmt % args))
 
     def _send(self, status, payload=None, raw=None, content_type="application/json; charset=utf-8", extra_headers=None):
         body = raw if raw is not None else json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
@@ -835,14 +841,17 @@ def selftest():
     import urllib.request
     import urllib.error
 
+    passed = 0
     failures = []
 
     def check(name, condition, detail=""):
+        nonlocal passed
         if condition:
-            print(f"  ok   {name}")
+            passed += 1
+            log("INFO", "Selftest", "用例通过: {}".format(name))
         else:
-            print(f"  FAIL {name} {detail}")
             failures.append(name)
+            log("ERROR", "Selftest", "用例失败: {} (detail={})".format(name, detail))
 
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = os.path.join(tmp, "data")
@@ -899,7 +908,7 @@ def selftest():
 
         sync = SYNC_PATH
 
-        print("配置：")
+        log("INFO", "Selftest", "section=config")
         config_file = os.path.join(tmp, CONFIG_NAME)
         with open(config_file, "w", encoding="utf-8") as handle:
             handle.write('{"host": "0.0.0.0", "port": 4936}')
@@ -916,7 +925,7 @@ def selftest():
         check("config.json 不是 JSON 时忽略", read_config(tmp) == {}, repr(read_config(tmp)))
         os.remove(config_file)
 
-        print("接口：")
+        log("INFO", "Selftest", "section=api")
         status, health = get(sync + "/health", token=None)
         check("health 不需要令牌", status == 200 and health.get("latestSeq") == 0, repr(health))
         check("health 标明需要令牌", health.get("authRequired") is True)
@@ -962,7 +971,7 @@ def selftest():
         status, body = post(sync + "/ops", {"device": "dev-a", "ops": [{"op": "put", "path": "../evil.md", "data": "x"}]})
         check("越界路径被拒绝", body["ok"] is False and "路径不合法" in body.get("error", ""), repr(body))
 
-        print("管理后台：")
+        log("INFO", "Selftest", "section=admin")
         status, page = get(ADMIN_PATH, token=None)
         check("管理页面可直接打开", status == 200 and "<!DOCTYPE html>" in page.get("_raw", ""), repr(page)[:160])
 
@@ -1059,7 +1068,7 @@ def selftest():
         httpd.shutdown()
         httpd.server_close()
 
-        print("重启后重建索引：")
+        log("INFO", "Selftest", "section=reload-journal")
         reloaded = Journal(data_dir)
         check("最新序号一致", reloaded.latest_seq == 4, str(reloaded.latest_seq))
         check("日志身份保持不变", reloaded.journal_id == journal.journal_id, f"{reloaded.journal_id} != {journal.journal_id}")
@@ -1067,17 +1076,16 @@ def selftest():
         check("删除记录一致", reloaded.deleted.get("notes/two.md") == 3, repr(reloaded.deleted))
         check("重启后仍能续写", reloaded.append_many("dev-a", [{"opId": "a-4", "op": "put", "path": "notes/three.md", "data": "3"}])[0]["seq"] == 5)
 
-        print("重启后管理数据：")
+        log("INFO", "Selftest", "section=reload-admin")
         reloaded_admin = AdminStore(data_dir)
         check("管理密码重新加载后仍然有效", reloaded_admin.verify_password("new-pass-12"), "密码校验失败")
         check("令牌保持删除后的状态", reloaded_admin.tokens == [], repr(reloaded_admin.tokens))
         check("会话只存在内存里", reloaded_admin.sessions == {}, repr(reloaded_admin.sessions))
 
-    print()
     if failures:
-        print(f"自测失败 {len(failures)} 项：" + "、".join(failures))
+        log("ERROR", "Selftest", "failed={} cases={}".format(len(failures), ",".join(failures)))
         return 1
-    print("自测全部通过")
+    log("INFO", "Selftest", "passed={} failed=0".format(passed))
     return 0
 
 
@@ -1149,8 +1157,8 @@ def main(argv=None):
     config = read_config(data_dir)
     host = args.host or config.get("host") or DEFAULT_HOST
     port = args.port or config.get("port") or DEFAULT_PORT
-    host_source = "--host 参数" if args.host else (config_file if config.get("host") else "内置默认值")
-    port_source = "--port 参数" if args.port else (config_file if config.get("port") else "内置默认值")
+    host_source = "--host" if args.host else ("config" if config.get("host") else "default")
+    port_source = "--port" if args.port else ("config" if config.get("port") else "default")
 
     httpd, journal, admin = create_server(host, port, data_dir, args.token)
 
@@ -1160,26 +1168,18 @@ def main(argv=None):
     else:
         url_host = bound_host
 
-    if host_source == port_source:
-        where = f"来自 {host_source}"
-    else:
-        where = f"地址来自 {host_source}，端口来自 {port_source}"
-
-    print(f"{SERVER_NAME} v{SERVER_VERSION} 已启动")
-    print(f"  数据：{data_dir}")
-    print(f"  配置：{config_file}" + ("" if os.path.isfile(config_file) else "（这个文件不存在，地址与端口都走默认值）"))
-    print(f"  监听：{bound_host}:{bound_port}（{where}）")
-    print(f"  同步：http://{url_host}:{bound_port}{SYNC_PATH}/*（客户端里只填 http://{url_host}:{bound_port} 就行）")
-    print(f"  日志：{os.path.join(data_dir, JOURNAL_NAME)}（journalId {journal.journal_id}）")
-    print(f"  管理：http://{url_host}:{bound_port}{ADMIN_PATH} "
-          + ("（已设置管理密码）" if admin.password_set() else "（首次打开会引导你设置管理密码）"))
-    print(f"  授权：{'--token 已启用' if args.token else '由管理后台发放令牌'}，"
-          f"当前 {len(admin.list_tokens())} 个令牌")
-    print(f"  当前：{journal.count} 条操作，最新序号 {journal.latest_seq}")
+    log("INFO", "Server", "启动 {} v{}".format(SERVER_NAME, SERVER_VERSION))
+    log("INFO", "Server", "dataDir={} config={} configFound={}".format(data_dir, config_file, os.path.isfile(config_file)))
+    log("INFO", "Server", "listen={}:{} hostSource={} portSource={}".format(bound_host, bound_port, host_source, port_source))
+    log("INFO", "Sync", "endpoint={}/* origin=http://{}:{}".format(SYNC_PATH, url_host, bound_port))
+    log("INFO", "Storage", "journal={} journalId={} ops={} latestSeq={}".format(
+        os.path.join(data_dir, JOURNAL_NAME), journal.journal_id, journal.count, journal.latest_seq))
+    log("INFO", "Admin", "endpoint={} passwordSet={}".format(ADMIN_PATH, admin.password_set()))
+    log("INFO", "Auth", "tokenSource={} tokenCount={}".format("--token" if args.token else "admin", len(admin.list_tokens())))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\n已停止")
+        log("INFO", "Server", "已停止")
     finally:
         httpd.server_close()
     return 0

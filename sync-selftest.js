@@ -16,6 +16,12 @@ function findSyncModule() {
 
 const sync = require(findSyncModule());
 
+function log(level, component, message) {
+  const line = `[${level}] [${component}] ${message}`;
+  if (level === 'ERROR' || level === 'WARN') console.error(line);
+  else console.log(line);
+}
+
 let failed = 0;
 let passed = 0;
 
@@ -23,14 +29,14 @@ function check(name, fn) {
   try {
     fn();
     passed += 1;
-    console.log(`  ok   ${name}`);
+    log('INFO', 'Selftest', `用例通过: ${name}`);
   } catch (error) {
     failed += 1;
-    console.log(`  FAIL ${name}\n       ${error.message}`);
+    log('ERROR', 'Selftest', `用例失败: ${name} (detail=${error.message})`);
   }
 }
 
-console.log('路径与哈希：');
+log('INFO', 'Selftest', 'section=path-hash');
 check('越界与空路径被拒绝', () => {
   assert.strictEqual(sync.normalizeRelative('../evil.md'), '');
   assert.strictEqual(sync.normalizeRelative('/abs.md'), '');
@@ -45,7 +51,7 @@ check('哈希基于字节', () => {
   assert.notStrictEqual(sync.hashBytes(Buffer.from('abc')), sync.hashBytes(Buffer.from('abd')));
 });
 
-console.log('重放决策：');
+log('INFO', 'Selftest', 'section=decide-apply');
 check('远端删除 + 本地没有该文件 → 什么都不做（不会凭空写回）', () => {
   assert.strictEqual(sync.decideApply({ op: 'del', path: 'notes/a.md' }, { localExists: false }), 'skip');
 });
@@ -65,7 +71,7 @@ check('本地有更晚的未推送改动 → 保留本地', () => {
   );
 });
 
-console.log('待推送队列：');
+log('INFO', 'Selftest', 'section=outbox');
 check('同一路径的连续改动合并成一条', () => {
   let list = [];
   list = sync.mergeOutboxOp(list, { opId: '1', path: 'notes/a.md', op: 'put', time: 1 });
@@ -155,7 +161,7 @@ function syncOnce(dev, server) {
   }
 }
 
-console.log('两台设备走一遍完整链路：');
+log('INFO', 'Selftest', 'section=two-devices');
 
 check('A 新建笔记 → B 同步后拿到', () => {
   const server = createServer();
@@ -243,9 +249,8 @@ check('远端更新的内容会覆盖本地没有再改过的文件', () => {
   assert.strictEqual(b.disk.get('notes/a.md'), sync.hashBytes(Buffer.from('第二版')));
 });
 
-console.log();
 if (failed) {
-  console.log(`自测失败 ${failed} 项，通过 ${passed} 项`);
+  log('ERROR', 'Selftest', `failed=${failed} passed=${passed}`);
   process.exit(1);
 }
-console.log(`自测全部通过（${passed} 项）`);
+log('INFO', 'Selftest', `passed=${passed} failed=0`);
