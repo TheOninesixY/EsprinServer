@@ -27,6 +27,11 @@ TOKENS_FILE_NAME = "tokens.json"
 ADMIN_COOKIE_NAME = "esprin_admin"
 ADMIN_PATH = "/admin"
 SYNC_PATH = "/sync"
+# 网页版入口：根路径返回该页面，页面静态资源挂在下面这两组前缀下
+HEALTH_PATH = "/health"
+WEB_INDEX_PATH = "/index.html"
+WEB_ASSET_PREFIXES = ("/styles/", "/scripts/")
+WEB_FAVICON_PATH = "/favicon.png"
 PBKDF2_ITERATIONS = 200_000
 PBKDF2_SALT_BYTES = 16
 SESSION_TTL_SECONDS = 12 * 60 * 60
@@ -462,6 +467,8 @@ class Journal:
 
 MANAGER_DIR_NAME = "manager"
 MANAGER_INDEX_NAME = "index.html"
+WEB_DIR_NAME = "web"
+WEB_INDEX_NAME = "index.html"
 ASSET_CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
@@ -487,8 +494,32 @@ MISSING_PAGE_HTML = """<!DOCTYPE html>
 """
 
 
+MISSING_WEB_PAGE_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><title>找不到网页版</title></head>
+<body style="font:14px/1.7 -apple-system,'Segoe UI','Microsoft YaHei',sans-serif;padding:40px;background:#0d1117;color:#f0f6fc">
+<h1 style="font-size:18px;margin-bottom:12px">找不到网页版</h1>
+<p style="color:#8b949e">服务端期望在下面这个位置读到 index.html：</p>
+<p><code style="background:#21262d;padding:6px 10px;border-radius:6px;display:inline-block">{path}</code></p>
+<p style="color:#8b949e">把仓库里的 web/ 目录（index.html、styles/、scripts/）放到服务端脚本旁边，再刷新本页。</p>
+</body></html>
+"""
+
+
 def manager_dir():
     return os.path.join(SCRIPT_DIR, MANAGER_DIR_NAME)
+
+
+def web_dir():
+    return os.path.join(SCRIPT_DIR, WEB_DIR_NAME)
+
+
+def read_web_index():
+    path = os.path.join(web_dir(), WEB_INDEX_NAME)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return MISSING_WEB_PAGE_HTML.replace("{path}", path)
 
 
 def read_manager_index():
@@ -548,9 +579,19 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _client_ip(self):
         return self.client_address[0] if self.client_address else ""
 
-    def _send_manager_asset(self, path):
-        relative = path[len(ADMIN_PATH):].lstrip("/") or MANAGER_INDEX_NAME
-        root = manager_dir()
+    # 同源判定：Origin 存在时必须与请求的 Host 一致（跨站请求即使带上 Cookie 也在这里被挡下）。
+    # 同源 GET 一般不携带 Origin，此时交给 SameSite=Lax 的 Cookie 策略兜底：
+    # 跨站 POST 不会带上登录态，而读取类接口都是 GET，没有副作用。
+    def _is_same_origin(self):
+        origin = self.headers.get("Origin", "")
+        if not origin:
+            return True
+        parsed_origin = urlparse(origin)
+        return bool(parsed_origin.netloc) and parsed_origin.netloc == self.headers.get("Host", "")
+
+    # 静态资源：相对路径先归一化，再确认落在指定根目录内，避免穿越到目录之外
+    def _send_static_asset(self, root, relative, fallback_name=""):
+        relative = str(relative or fallback_name).lstrip("/")
         target = os.path.abspath(os.path.join(root, relative))
         if not target.startswith(root + os.sep) or not os.path.isfile(target):
             self._send(404, {"ok": False, "error": "找不到文件"})
@@ -559,7 +600,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             with open(target, "rb") as handle:
                 body = handle.read()
-        except OSError:
+        except OSError as error:
+            log("ERROR", "Static", "读取失败: {} (path={})".format(error, target))
             self._send(500, {"ok": False, "error": "读取失败"})
             return
 
@@ -568,21 +610,33 @@ class ApiHandler(BaseHTTPRequestHandler):
                    content_type=ASSET_CONTENT_TYPES.get(extension, "application/octet-stream"),
                    extra_headers={"Cache-Control": "no-store"})
 
+    def _send_manager_asset(self, path):
+        self._send_static_asset(manager_dir(), path[len(ADMIN_PATH):], MANAGER_INDEX_NAME)
+
+    def _send_web_asset(self, path):
+        self._send_static_asset(web_dir(), path, WEB_INDEX_NAME)
+
     def _authorize_api(self):
         header = self.headers.get("Authorization", "")
-        if not header.startswith("Bearer "):
-            return None, "缺少访问令牌"
-        value = header[7:].strip()
+        if header.startswith("Bearer "):
+            value = header[7:].strip()
 
-        if self.token and hmac.compare_digest(value, self.token):
-            return {"id": "", "name": "启动参数 --token", "device": "", "builtin": True}, ""
+            if self.token and hmac.compare_digest(value, self.token):
+                return {"id": "", "name": "启动参数 --token", "device": "", "builtin": True}, ""
 
-        record = self.admin.find_token_by_plain(value)
-        if not record:
-            return None, "令牌无效（请在管理后台确认，或看看是不是刚重置过）"
-        if not record.get("enabled", True):
-            return None, "该令牌已在管理后台停用"
-        return record, ""
+            record = self.admin.find_token_by_plain(value)
+            if not record:
+                return None, "令牌无效（请在管理后台确认，或看看是不是刚重置过）"
+            if not record.get("enabled", True):
+                return None, "该令牌已在管理后台停用"
+            return record, ""
+
+        # 同源网页版：只认管理后台的登录会话（网页版由本服务端托管，用同一份静默会话）。
+        # 未配置任何凭据时不再放行：读写一律要求管理密码会话或访问令牌
+        if self._is_same_origin() and self._has_session():
+            return {"id": "", "name": "网页版会话", "device": "", "builtin": False}, ""
+
+        return None, "缺少凭据（网页版请先登录管理后台，客户端请在设置里填写访问令牌）"
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -604,20 +658,36 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "version": SERVER_VERSION,
                 "journalId": self.journal.journal_id,
                 "latestSeq": self.journal.latest_seq,
-                "authRequired": bool(self.token) or bool(self.admin.list_tokens()),
+                "authRequired": True,
                 "syncPath": SYNC_PATH,
                 "adminPath": ADMIN_PATH,
             })
             return
 
-        if parsed.path == "/":
+        if parsed.path == HEALTH_PATH:
             self._send(200, {
                 "ok": True,
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION,
+                "webPath": "/",
                 "syncPath": SYNC_PATH,
                 "adminPath": ADMIN_PATH,
+                # 网页版据此选择登录方式：已设密码走密码登录，否则填写访问令牌
+                "passwordSet": self.admin.password_set(),
+                "tokenCount": len(self.admin.list_tokens()),
+                "authRequired": True,
             })
+            return
+
+        # 网页版：根路径返回应用页面，页面资源按前缀从 web/ 目录取
+        if parsed.path == "/" or parsed.path == WEB_INDEX_PATH:
+            page = read_web_index()
+            self._send(200, raw=page.encode("utf-8"), content_type="text/html; charset=utf-8",
+                       extra_headers={"Cache-Control": "no-store"})
+            return
+
+        if parsed.path.startswith(WEB_ASSET_PREFIXES) or parsed.path == WEB_FAVICON_PATH:
+            self._send_web_asset(parsed.path)
             return
 
         if parsed.path == ADMIN_PATH or parsed.path == ADMIN_PATH + "/":
@@ -875,12 +945,14 @@ def selftest():
             else:
                 cookies.pop(key.strip(), None)
 
-        def call(method, path, payload=None, token=None, use_cookie=False):
+        def call(method, path, payload=None, token=None, use_cookie=False, origin=None):
             data = None
             headers = {}
             if payload is not None:
                 data = _json.dumps(payload).encode("utf-8")
                 headers["Content-Type"] = "application/json"
+            if origin:
+                headers["Origin"] = origin
             request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
             if token is not None:
                 request.add_header("Authorization", "Bearer " + token)
@@ -900,11 +972,11 @@ def selftest():
                     parsed = {"_raw": body}
                 return error.code, parsed
 
-        def get(path, token="secret", cookie=False):
-            return call("GET", path, token=token, use_cookie=cookie)
+        def get(path, token="secret", cookie=False, origin=None):
+            return call("GET", path, token=token, use_cookie=cookie, origin=origin)
 
-        def post(path, payload, token="secret", cookie=False):
-            return call("POST", path, payload, token=token, use_cookie=cookie)
+        def post(path, payload, token="secret", cookie=False, origin=None):
+            return call("POST", path, payload, token=token, use_cookie=cookie, origin=origin)
 
         sync = SYNC_PATH
 
@@ -984,6 +1056,29 @@ def selftest():
         status, body = get(ADMIN_PATH + "/%2e%2e/%2e%2e/EsprinServer.py", token=None)
         check("静态资源不允许穿越出 manager 目录", status == 404, repr(body))
 
+        log("INFO", "Selftest", "section=web-app")
+        status, page = get("/", token=None)
+        check("根路径返回网页版页面", status == 200 and "<!DOCTYPE html>" in page.get("_raw", ""), repr(page)[:160])
+        status, page = get(WEB_INDEX_PATH, token=None)
+        check("网页版页面可直接打开", status == 200 and "EsprinNemo" in page.get("_raw", ""), repr(page)[:160])
+
+        status, css = get("/styles/tokens.css", token=None)
+        check("网页版样式可直接取用", status == 200 and "--bg-body" in css.get("_raw", ""), repr(css)[:80])
+
+        status, body = get("/scripts/store.js", token=None)
+        check("网页版脚本可直接取用", status == 200 and "FileStore" in body.get("_raw", ""), repr(body)[:80])
+
+        status, body = get("/styles/../../EsprinServer.py", token=None)
+        check("网页版资源不允许穿越出 web 目录", status == 404, repr(body))
+
+        status, body = get(HEALTH_PATH, token=None)
+        check("health 告知网页版入口与凭据状态",
+              status == 200 and body.get("webPath") == "/" and body.get("passwordSet") is False
+              and body.get("authRequired") is True, repr(body))
+
+        status, body = get(sync + "/state", token=None)
+        check("未登录的同源请求仍然 401", status == 401, repr(body))
+
         status, body = get(ADMIN_PATH + "/api/status", token=None)
         check("初始状态：未设密码、未登录", status == 200 and body.get("passwordSet") is False and body.get("loggedIn") is False, repr(body))
 
@@ -1001,6 +1096,13 @@ def selftest():
 
         status, body = get(ADMIN_PATH + "/api/tokens", token=None, cookie=True)
         check("登录后可以看令牌列表", status == 200 and body.get("tokens") == [], repr(body))
+
+        status, body = get(sync + "/state", token=None, cookie=True)
+        check("同源网页版持登录态可读同步接口", status == 200 and "files" in body, repr(body)[:120])
+        status, body = get(sync + "/state", token=None, cookie=True, origin="https://evil.example")
+        check("跨站请求带登录态也不放行", status == 401, repr(body))
+        status, body = get(HEALTH_PATH, token=None)
+        check("设过密码后 health 标明需要鉴权", body.get("passwordSet") is True, repr(body))
 
         status, body = post(ADMIN_PATH + "/api/tokens", {"name": "台式机", "device": "dev-bound"}, token=None, cookie=True)
         token_a = body.get("token", "")
@@ -1064,6 +1166,37 @@ def selftest():
         check("退出登录后会话失效", status == 200 and status2 == 401, f"{status}/{status2}")
 
         check("启动参数 --token 仍然可用", get(sync + "/ops?since=0")[0] == 200)
+
+        log("INFO", "Selftest", "section=forced-auth")
+        strict_httpd, _, _ = create_server("127.0.0.1", 0, os.path.join(tmp, "strict-data"), "")
+        strict_port = strict_httpd.server_address[1]
+        threading.Thread(target=strict_httpd.serve_forever, daemon=True).start()
+        strict_base = f"http://127.0.0.1:{strict_port}"
+        try:
+            with urllib.request.urlopen(strict_base + HEALTH_PATH, timeout=5) as response:
+                strict_health = _json.loads(response.read().decode("utf-8"))
+            check("未配置凭据时 health 仍然声明需要鉴权",
+                  strict_health.get("authRequired") is True and strict_health.get("passwordSet") is False
+                  and strict_health.get("tokenCount") == 0, repr(strict_health))
+
+            strict_status = 0
+            try:
+                urllib.request.urlopen(strict_base + SYNC_PATH + "/state", timeout=5)
+            except urllib.error.HTTPError as error:
+                strict_status = error.code
+                error.read()
+            check("未配置凭据时同源请求不再放行", strict_status == 401, str(strict_status))
+
+            strict_status = 0
+            try:
+                urllib.request.urlopen(strict_base + SYNC_PATH + "/health", timeout=5)
+            except urllib.error.HTTPError as error:
+                strict_status = error.code
+                error.read()
+            check("health 仍然无需凭据", strict_status == 0, str(strict_status))
+        finally:
+            strict_httpd.shutdown()
+            strict_httpd.server_close()
 
         httpd.shutdown()
         httpd.server_close()
@@ -1143,7 +1276,7 @@ def main(argv=None):
     parser.add_argument("--host", help=f"监听地址，不传则用 {CONFIG_NAME} 里的 host，再不行用 {DEFAULT_HOST}（局域网共享可写 0.0.0.0）")
     parser.add_argument("--port", type=int, help=f"监听端口，不传则用 {CONFIG_NAME} 里的 port，再不行用 {DEFAULT_PORT}")
     parser.add_argument("--data", default="./data", help="日志存放目录")
-    parser.add_argument("--token", default=os.environ.get("ESPRIN_TOKEN", ""), help="访问令牌，留空则不校验")
+    parser.add_argument("--token", default=os.environ.get("ESPRIN_TOKEN", ""), help="访问令牌；不传则凭据只来自管理后台（管理密码登录或在那里创建的访问令牌）")
     parser.add_argument("--selftest", action="store_true", help="跑一遍内置自测后退出")
     args = parser.parse_args(argv)
 
@@ -1176,6 +1309,8 @@ def main(argv=None):
         os.path.join(data_dir, JOURNAL_NAME), journal.journal_id, journal.count, journal.latest_seq))
     log("INFO", "Admin", "endpoint={} passwordSet={}".format(ADMIN_PATH, admin.password_set()))
     log("INFO", "Auth", "tokenSource={} tokenCount={}".format("--token" if args.token else "admin", len(admin.list_tokens())))
+    if not admin.password_set() and not admin.list_tokens() and not args.token:
+        log("WARN", "Auth", "未配置任何凭据：同步接口一律返回 401 (action={} 设置管理密码或创建访问令牌)".format(ADMIN_PATH))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

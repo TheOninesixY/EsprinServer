@@ -1,0 +1,376 @@
+/* 界面布局：现代布局（<html class="modern-layout">）没有标题栏。
+   标题栏整条移除——内容一路顶到窗口上沿、不再空出一条顶栏：应用名移到侧边栏顶部，
+   标签栏挪到工作区顶部那一行（见下面的「工作区的标签栏」），
+   工具按钮脱离布局、悬浮在窗口右上角（网页版没有窗口操作键，这一组只剩工具按钮），
+   原本由标题栏承担的拖动改由几处留白接手（见下面的拖动区）。
+   除这一条顶栏之外功能一个不少：AI 助手面板与设置里的分类、小本本、
+   侧边栏的文件夹与标签过滤都与经典布局一致。
+   布局切换见 scripts/mode.js，首屏的类名由 boot.js 提前写入，因此不会先闪出完整界面再收起。
+
+   本文件与桌面版 EsprinNemo 的 styles/mode.css 逐条对应，只有一处不同：
+   右侧走廊宽度改用 --modern-corridor / --modern-tools 两个变量表达。桌面版写死 280px / 270px
+   （4 个工具按钮 + 3 个窗口键），网页版没有窗口操作键、却多一个同步状态入口，
+   因此在 styles/web.css 里重设这两个变量，排版规则本身一个字不改。 */
+
+html.modern-layout {
+    --modern-corridor: 280px;
+    --modern-tools: 270px;
+    --tabs-back-slot: 40px;
+}
+
+/* ---------------- 标题栏 ----------------
+   .titlebar 只剩「右上角悬浮按钮组的定位容器」这一个身份——不再占高度，也不再整条作为拖动区域
+   （整条拖动区会吞掉它下面搜索框、工具栏的鼠标事件），空白处 pointer-events: none 直接透传。 */
+html.modern-layout .titlebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 40px;
+    padding: 0;
+    justify-content: flex-end;
+    background-color: transparent;
+    border-bottom: none;
+    -webkit-app-region: no-drag;
+    pointer-events: none;
+}
+html.modern-layout .titlebar-brand,
+html.modern-layout .titlebar-tabs,
+html.modern-layout .titlebar-divider,
+html.modern-layout .titlebar-title {
+    display: none !important;
+}
+html.modern-layout .titlebar .titlebar-actions,
+html.modern-layout .titlebar .window-controls {
+    pointer-events: auto;
+}
+
+/* 标签栏那一行的高度：标签栏自己与空状态拖动区（见下面）共用这一个值。
+   「禁用标签页」开关打开时归零：那一行不再占位，空状态拖动区可以重新铺到窗口上沿 */
+html.modern-layout {
+    --modern-tabs-height: 40px;
+    --modern-drag-top: var(--modern-tabs-height);
+}
+html.modern-layout.tabs-disabled {
+    --modern-tabs-height: 0px;
+}
+/* 一个标签都没有：标签栏整条收起（见下面那条 :empty 规则），那一行也就不再是拖动区 */
+html.modern-layout:has(#workspace-tabs:empty) {
+    --modern-drag-top: 0px;
+}
+
+/* ---------------- 工作区的标签栏 ---------------- */
+html.modern-layout .workspace-tabs {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    height: var(--modern-tabs-height);
+    gap: 6px;
+    padding: 0 8px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    margin-right: var(--modern-corridor);
+    transition: margin-right var(--motion-slow) var(--ease-out),
+                padding-left var(--motion-base) var(--ease-out),
+                --tabs-fade var(--motion-base) var(--ease-out),
+                --tabs-fade-left var(--motion-base) var(--ease-out);
+    position: relative;
+    z-index: 11;
+    -webkit-app-region: drag;
+}
+html.modern-layout .workspace-tabs::-webkit-scrollbar {
+    display: none;
+}
+html.modern-layout .workspace-tabs:empty {
+    display: none;
+}
+html.modern-layout.tabs-disabled .workspace-tabs {
+    display: none;
+}
+
+/* ---------------- 标签栏两端的渐隐（左端还要让开「返回」） ---------------- */
+@property --tabs-fade {
+    syntax: '<length>';
+    inherits: false;
+    initial-value: 0px;
+}
+@property --tabs-fade-left {
+    syntax: '<length>';
+    inherits: false;
+    initial-value: 0px;
+}
+html.modern-layout .workspace-tabs {
+    --tabs-fade: 0px;
+    --tabs-fade-left: 0px;
+    -webkit-mask-image: linear-gradient(to right,
+        transparent 0,
+        #000 var(--tabs-fade-left),
+        #000 calc(100% - var(--tabs-fade)),
+        transparent 100%);
+    mask-image: linear-gradient(to right,
+        transparent 0,
+        #000 var(--tabs-fade-left),
+        #000 calc(100% - var(--tabs-fade)),
+        transparent 100%);
+}
+html.modern-layout .workspace-tabs.tabs-fade-left {
+    --tabs-fade-left: 32px;
+}
+html.modern-layout .workspace-tabs.tabs-fade-right {
+    --tabs-fade: 32px;
+}
+html.modern-layout .workspace:has(#editor-topbar:not(.hidden)) .workspace-tabs {
+    -webkit-mask-image: linear-gradient(to right,
+        transparent calc(var(--tabs-back-slot) - 6px),
+        #000 calc(var(--tabs-back-slot) - 6px + var(--tabs-fade-left)),
+        #000 calc(100% - var(--tabs-fade)),
+        transparent 100%);
+    mask-image: linear-gradient(to right,
+        transparent calc(var(--tabs-back-slot) - 6px),
+        #000 calc(var(--tabs-back-slot) - 6px + var(--tabs-fade-left)),
+        #000 calc(100% - var(--tabs-fade)),
+        transparent 100%);
+}
+
+/* ---------------- 标签栏最左侧的「返回」 ---------------- */
+.tabs-back {
+    display: none;
+}
+.tabs-back .tabs-back-icon-home {
+    display: none;
+}
+html.modern-layout:not(.tabs-disabled) .tabs-back .tabs-back-icon-back {
+    display: none;
+}
+html.modern-layout:not(.tabs-disabled) .tabs-back .tabs-back-icon-home {
+    display: inline-flex;
+}
+html.modern-layout .tabs-back {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: absolute;
+    top: 6px;
+    left: 6px;
+    width: 28px;
+    height: 28px;
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    opacity: 0;
+    transform: translateX(-6px);
+    pointer-events: none;
+    z-index: 12;
+    -webkit-app-region: no-drag;
+    transition: opacity var(--motion-base) var(--ease-out),
+                transform var(--motion-base) var(--ease-out),
+                background-color 0.15s, color 0.15s;
+}
+html.modern-layout .tabs-back:hover {
+    background-color: var(--item-hover);
+    color: var(--text-primary);
+}
+html.modern-layout .workspace:has(#editor-topbar:not(.hidden)) .tabs-back {
+    opacity: 1;
+    transform: none;
+    pointer-events: auto;
+}
+html.modern-layout .workspace:has(#editor-topbar:not(.hidden)) .workspace-tabs {
+    padding-left: var(--tabs-back-slot);
+}
+
+/* ---------------- 笔记列表表头与工作区顶部那一段对齐 ---------------- */
+html.modern-layout .notes-panel-header {
+    min-height: calc(var(--modern-tabs-height) + 40px);
+    justify-content: space-between;
+}
+html.modern-layout.tabs-disabled .notes-panel-header {
+    border-bottom-color: transparent;
+}
+
+/* ---------------- 拖动区 ----------------
+   拖动窗口改由几处留白承担：编辑器顶栏里的空闲段、笔记列表顶部搜索栏那一行、
+   工作区顶部的标签栏与标签之外的留白、设置页的标题区与分类侧边栏、
+   空状态的工作区（见下面 .empty-drag-surface）、AI 面板顶部那条空白
+   与面板顶栏，以及侧边栏「新建」周围的留白。
+   一条硬约束：拖动区一律不能伸到悬浮按钮下面，因此与按钮同处一行的
+   标签栏、设置内容区各自让出右侧走廊。
+
+   注：网页版没有可拖动的原生窗口，-webkit-app-region 在浏览器里不生效；
+   这些声明照桌面版原样保留，既不影响点击，也让两份样式表逐条对得上。 */
+html.modern-layout .editor-meta,
+html.modern-layout .editor-actions,
+html.modern-layout .notes-panel-header,
+html.modern-layout .settings-header,
+html.modern-layout .settings-sidebar,
+html.modern-layout .sidebar-action-wrap {
+    -webkit-app-region: drag;
+}
+html.modern-layout .editor-meta > *,
+html.modern-layout .editor-view-modes,
+html.modern-layout .notes-panel-header .search-box,
+html.modern-layout .notes-panel-header .dropdown,
+html.modern-layout .settings-sidebar .settings-back,
+html.modern-layout .settings-sidebar .settings-nav-item,
+html.modern-layout .sidebar-action-wrap .btn-sidebar-new {
+    -webkit-app-region: no-drag;
+}
+html.modern-layout .dropdown-menu,
+html.modern-layout .context-menu {
+    -webkit-app-region: no-drag;
+}
+
+/* 空状态的工作区：拖动区由 #empty-state 里的 .empty-drag-surface 承担 */
+html.modern-layout .empty-drag-surface {
+    display: block;
+    position: absolute;
+    inset: var(--modern-drag-top) var(--modern-corridor) 0 0;
+    z-index: -1;
+    -webkit-app-region: drag;
+}
+
+/* 设置内容区仍要让出走廊：它是从窗口上沿开始滚动的，滚到顶时第一屏就落在按钮下面 */
+html.modern-layout .settings-view .settings-content {
+    padding-top: 0;
+    padding-right: var(--modern-corridor);
+}
+html.modern-layout .settings-view .settings-header {
+    padding-top: 32px;
+}
+/* 编辑器顶栏的左右内边距都收到 8px */
+html.modern-layout .editor-topbar {
+    padding: 0 8px;
+}
+html.modern-layout.tabs-disabled .editor-topbar {
+    padding-right: var(--modern-corridor);
+    transition: padding-right var(--motion-slow) var(--ease-out),
+                padding-left var(--motion-base) var(--ease-out);
+}
+html.modern-layout.tabs-disabled .editor-topbar {
+    padding-left: var(--tabs-back-slot);
+}
+html.modern-layout.tabs-disabled .app-body:has(#ai-panel:not(.hidden):not(.ai-collapsed)) .editor-topbar {
+    padding-right: 16px;
+}
+/* 网页版没有窗口操作键，全屏与窗口态的工具按钮组同宽 */
+html.modern-layout body.is-fullscreen .settings-view .settings-content {
+    padding-right: var(--modern-tools);
+}
+html.modern-layout body.is-fullscreen .workspace-tabs {
+    margin-right: var(--modern-tools);
+    -webkit-app-region: no-drag;
+}
+
+/* AI 面板：面板里垫一块 40px 的拖动空白，把面板顶栏让到悬浮按钮下面 */
+html.modern-layout .ai-panel-drag-strip {
+    display: block;
+    margin-right: var(--modern-tools);
+    -webkit-app-region: drag;
+}
+html.modern-layout body.is-fullscreen .ai-panel-drag-strip {
+    margin-right: var(--modern-tools);
+}
+html.modern-layout .ai-panel-header {
+    -webkit-app-region: drag;
+}
+html.modern-layout .ai-panel-header .btn-action-icon {
+    -webkit-app-region: no-drag;
+}
+html.modern-layout .ai-drawer {
+    top: 80px;
+}
+
+/* 面板打开时，右侧那一段已归面板所有，标签栏与空状态拖动层都不必再让出走廊 */
+html.modern-layout .app-body:has(#ai-panel:not(.hidden):not(.ai-collapsed)) .workspace-tabs {
+    margin-right: 16px;
+}
+html.modern-layout .app-body:has(#ai-panel:not(.hidden):not(.ai-collapsed)) .empty-drag-surface {
+    inset: var(--modern-drag-top) 0 0 0;
+}
+
+/* ---------------- 应用名与「新建」按钮 ---------------- */
+.sidebar-brand {
+    display: none;
+    font-family: 'Mohave', var(--font-sans);
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: 0.4px;
+    color: var(--brand-fg);
+    padding: 4px 6px;
+    margin-bottom: 6px;
+}
+html.modern-layout .sidebar-brand {
+    display: block;
+    margin-bottom: 0;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+html.modern-layout .sidebar-action-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px;
+}
+html.modern-layout .sidebar-action-wrap .btn-sidebar-new {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    gap: 0;
+    padding: 0;
+}
+html.modern-layout .sidebar-action-wrap .nav-text {
+    display: none;
+}
+html.modern-layout .sidebar-action-wrap .btn-new-note-icon {
+    position: static;
+    transform: none;
+    opacity: 1;
+}
+html.sidebar-collapsed .sidebar .sidebar-brand {
+    display: none;
+}
+html.sidebar-collapsed .sidebar .sidebar-action-wrap {
+    justify-content: center;
+}
+
+/* ---------------- 设置页里的「禁用标签页」 ---------------- */
+.settings-row-modern-only {
+    display: none;
+}
+html.modern-layout .settings-row-modern-only {
+    display: flex;
+}
+
+/* ---------------- 设置页的返回入口 ---------------- */
+.settings-back {
+    display: none;
+}
+html.modern-layout .settings-back {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 6px;
+    width: 100%;
+    padding: 6px 8px;
+    margin-bottom: 8px;
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    font-size: 12.5px;
+    transition: background-color 0.15s, color 0.15s;
+}
+html.modern-layout .settings-back:hover {
+    background-color: var(--item-hover);
+    color: var(--text-primary);
+}
+
+/* 动效偏好 */
+@media (prefers-reduced-motion: reduce) {
+    html.modern-layout .workspace-tabs,
+    html.modern-layout .tabs-back,
+    html.modern-layout.tabs-disabled .editor-topbar {
+        transition: none !important;
+    }
+}
