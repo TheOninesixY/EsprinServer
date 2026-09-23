@@ -353,7 +353,10 @@ function formatFileSize(bytes) {
 
 function describeJournal(data) {
     if (!data || !data.exists || !Number(data.ops)) return '';
+    // 「可复用 ID」是删除腾出来的 ID：新建条目会优先把它们再用起来
+    const recyclable = Number(data.recyclable);
     return Number(data.ops) + ' 条操作 · 存活文件 ' + Number(data.files) + ' · 删除记录 ' + Number(data.deleted)
+        + (recyclable ? '（可复用 ID ' + recyclable + '）' : '')
         + ' · 最新序号 ' + Number(data.latestSeq) + ' · ' + formatFileSize(data.size)
         + ' · 最后写入 ' + formatTime(data.updatedAt);
 }
@@ -361,6 +364,7 @@ function describeJournal(data) {
 async function loadJournal() {
     const summary = $('journal-summary');
     const button = $('journal-download');
+    const compactButton = $('journal-compact');
     const { status, data } = await api('/journal');
     if (status === 401) {
         state.loggedIn = false;
@@ -372,6 +376,7 @@ async function loadJournal() {
         summary.textContent = '读取日志状态失败：' + ((data && data.error) || 'HTTP ' + status);
         summary.title = '';
         button.disabled = true;
+        if (compactButton) compactButton.disabled = true;
         return;
     }
 
@@ -380,6 +385,7 @@ async function loadJournal() {
         summary.textContent = '还没有任何操作：客户端同步过一次之后，日志里才会有内容';
         summary.title = '';
         button.disabled = true;
+        if (compactButton) compactButton.disabled = true;
         return;
     }
 
@@ -387,6 +393,7 @@ async function loadJournal() {
     // 日志身份：与客户端「诊断」报告里的同一项对得上，说明两边看的是同一份日志
     summary.title = data.journalId ? '日志身份：' + data.journalId : '';
     button.disabled = false;
+    if (compactButton) compactButton.disabled = false;
 }
 
 function attachmentFileName(header) {
@@ -455,6 +462,50 @@ async function downloadJournal() {
         button.textContent = button.dataset.idle || '下载日志';
         // 下载期间可能又有新的操作写进日志：顺手刷新一次概览（它也会重新决定按钮是否可用）
         if (!sessionLost) await loadJournal();
+    }
+}
+
+/* 整理日志：把已彻底删除的条目从日志里真正抹掉（每条只留一行删除标记，序号一律不变）。
+   客户端推上一条删除时服务端会自动做这件事，这里是把以前积压下来的旧记录一并清掉。 */
+async function compactJournal() {
+    const button = $('journal-compact');
+    if (!button || button.disabled) return;
+
+    button.disabled = true;
+    const idle = button.textContent;
+    button.textContent = '整理中…';
+    setMessage('journal-status', '正在抹掉已彻底删除条目的正文与历史…');
+
+    try {
+        const { status, data } = await api('/journal/compact', {});
+        if (status === 401) {
+            state.loggedIn = false;
+            render();
+            return;
+        }
+        if (status !== 200) {
+            const message = (data && data.error) || ('整理失败（HTTP ' + status + '）');
+            setMessage('journal-status', message, 'error');
+            toast(message, 'error');
+            return;
+        }
+
+        const removed = Number(data.removed) || 0;
+        if (removed) {
+            const message = '已抹掉 ' + removed + ' 行（涉及 ' + Number(data.paths) + ' 条已彻底删除的条目），'
+                + '日志现在 ' + Number(data.kept) + ' 行。';
+            setMessage('journal-status', message, 'ok');
+            toast('日志已整理：抹掉 ' + removed + ' 行');
+        } else {
+            setMessage('journal-status', '没有可整理的内容：已彻底删除的条目在日志里只留着一条删除标记。', 'ok');
+            toast('日志无需整理');
+        }
+    } catch (error) {
+        setMessage('journal-status', '整理失败，请检查网络后重试', 'error');
+        toast('整理失败，请检查网络后重试', 'error');
+    } finally {
+        button.textContent = idle || '整理日志';
+        await loadJournal();
     }
 }
 
@@ -532,6 +583,12 @@ function bindEvents() {
     $('journal-refresh').addEventListener('click', async () => {
         await loadJournal();
         toast('日志概览已刷新');
+    });
+    $('journal-compact').addEventListener('click', () => {
+        compactJournal().catch((error) => {
+            console.error('整理日志失败:', error);
+            setMessage('journal-status', '整理失败，请检查网络后重试', 'error');
+        });
     });
     $('journal-download').addEventListener('click', () => {
         downloadJournal().catch((error) => {

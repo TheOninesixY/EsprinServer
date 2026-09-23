@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import socket
 import sys
@@ -45,6 +46,15 @@ DEFAULT_PAGE_LIMIT = 500
 MAX_PAGE_LIMIT = 2000
 MAX_DATA_CHARS = 8 * 1024 * 1024
 FORBIDDEN_PATH_PARTS = ("..",)
+# 可复用 ID（回收池）：
+#   条目被删除后，它的路径会一直留在 deleted 里（别处的老副本因此不会被推回来），
+#   但那个 ID 不必永久占着——新建条目时优先把 ID 还回去再用。
+#   服务端只把同一个 ID 发给一台设备：领走的会被占住 RECYCLE_HOLD_SECONDS 秒，
+#   直到条目真的被创建（put 会同时撤销删除记录与占位），或者占位超时自然回到池子里。
+ITEM_PATH_PATTERN = re.compile(r"^(notes|todos)/([A-Za-z0-9_-]{1,64})\.md$")
+RECYCLE_HOLD_SECONDS = 15 * 60
+RECYCLE_POOL_LIMIT = 500
+RECYCLE_CLAIM_MAX = 8
 
 
 def now_ms():
@@ -75,6 +85,14 @@ def normalize_relative_path(value):
     if not parts or any(part in FORBIDDEN_PATH_PARTS for part in parts):
         return ""
     return "/".join(parts)
+
+
+def parse_int(value, default, minimum, maximum):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(number, maximum))
 
 
 def hash_password(password, iterations=PBKDF2_ITERATIONS, salt=None):
@@ -309,6 +327,10 @@ class Journal:
         self.op_ids = {}
         self.files = {}
         self.deleted = {}
+        # 删除记录是哪台设备删的（path → device）：发起删除的那一台可以立刻把 ID 领回去用
+        self.deleted_by = {}
+        # 已被某台设备领走、还在等它把条目建回来的 ID（path → {device, until}）
+        self.holds = {}
         self.count = 0
         self._load()
         self.journal_id = self._load_or_create_id()
@@ -356,16 +378,25 @@ class Journal:
         op_id = entry.get("opId")
         if op_id:
             self.op_ids[op_id] = seq
+        # 删除标记上记着已经抹掉的那些操作号：客户端断线重试同一个 opId 时照样算「收过」
+        for purged_id in entry.get("purged") or []:
+            if purged_id:
+                self.op_ids.setdefault(str(purged_id), seq)
 
         path = entry.get("path")
         if not path:
             return
         if entry.get("op") == "del":
+            # 删除：记下删除记录（tombstone，别处的老副本不会被推回来），并把存活索引里的那条拿掉
             self.files.pop(path, None)
             self.deleted[path] = seq
+            self.deleted_by[path] = str(entry.get("device") or "")
         else:
             self.files[path] = {"hash": entry.get("hash", ""), "seq": seq, "device": entry.get("device", "")}
+            # 条目被重新创建（可能是用回收的 ID 建的）：删除记录与领走 ID 的占位一并撤销
             self.deleted.pop(path, None)
+            self.deleted_by.pop(path, None)
+            self.holds.pop(path, None)
 
     def append_many(self, device, ops):
         accepted = []
@@ -462,13 +493,175 @@ class Journal:
             return None
         return latest
 
+    def _recyclable(self):
+        """可复用的 ID：被删除过、此后没有再被创建过的条目标。
+        按删除时的序号倒序（刚删掉的最先被复用——那正是发起删除的设备刚腾出来的 ID），
+        刚被别的设备领走还没落盘的不在其中。调用方需持有 self.lock。"""
+        now = now_ms()
+        pool = []
+        for path, seq in self.deleted.items():
+            if path in self.files:
+                continue
+            match = ITEM_PATH_PATTERN.match(path)
+            if not match:
+                continue
+            hold = self.holds.get(path)
+            if hold:
+                if now < int(hold.get("until") or 0):
+                    continue
+                self.holds.pop(path, None)
+            pool.append({"id": match.group(2), "kind": match.group(1), "path": path, "seq": seq,
+                         "device": self.deleted_by.get(path, "")})
+        pool.sort(key=lambda item: item["seq"], reverse=True)
+        return pool
+
+    def recyclable(self, limit=RECYCLE_POOL_LIMIT):
+        with self.lock:
+            return self._recyclable()[:max(0, int(limit))]
+
+    def compact(self, paths=None):
+        """把已经彻底删除的路径的历史从日志里抹掉，每个这样的路径只留最后那一条删除标记。
+
+        删除必须留下痕迹：别的设备靠它知道这个路径已删（本地残留的老副本不会被推回来），
+        回收池也靠它知道哪个 ID 可以再用。但它以前写过什么、改过多少次都没必要留着——
+        「彻底删除」就该真的从日志里消失。
+
+        其余操作的序号一个不动（序号有空洞不影响按 since 增量拉取），
+        各设备记的「已应用到第几号」因此照旧有效。
+        paths 给定时只整理这些路径（客户端推上一条删除之后就只整理那一条）。
+        """
+        wanted = None
+        if paths is not None:
+            wanted = {normalize_relative_path(item) for item in paths}
+            wanted.discard("")
+
+        with self.lock:
+            if not os.path.isfile(self.path):
+                return {"removed": 0, "kept": 0, "paths": 0}
+
+            with open(self.path, "r", encoding="utf-8") as handle:
+                entries = []
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append((json.loads(line), line))
+                    except json.JSONDecodeError:
+                        entries.append((None, line))
+
+            # 每条路径最后一条操作是什么、落在哪一行
+            last_op = {}
+            last_index = {}
+            for index, (entry, _line) in enumerate(entries):
+                path = entry.get("path") if entry else None
+                if not path:
+                    continue
+                last_op[path] = entry.get("op")
+                last_index[path] = index
+
+            # 最后一条是删除的路径：以前的行全部去掉，只留那条删除标记
+            removable = {path for path, op in last_op.items()
+                         if op == "del" and (wanted is None or path in wanted)}
+            markers = {last_index[path] for path in removable}
+
+            # 被抹掉的那些操作号记在删除标记上：客户端断线重试同一个 opId 时，
+            # 服务端还能认出「这条已经收过了」，不会把已经删掉的内容又写回来。
+            # （操作号里只有设备与时间，不含路径与正文。）
+            purged = {}
+            for index, (entry, _line) in enumerate(entries):
+                if not entry:
+                    continue
+                path = entry.get("path")
+                if path not in removable:
+                    continue
+                # 留下来的那条标记：把它以前记着的操作号继续带上
+                if index in markers:
+                    for op_id in entry.get("purged") or []:
+                        purged.setdefault(path, set()).add(str(op_id))
+                    continue
+                # 要被抹掉的每一行：它自己的操作号，以及它以前记着的（老标记），都并到新标记上
+                if entry.get("opId"):
+                    purged.setdefault(path, set()).add(str(entry["opId"]))
+                for op_id in entry.get("purged") or []:
+                    purged.setdefault(path, set()).add(str(op_id))
+
+            kept = []
+            for index, (entry, line) in enumerate(entries):
+                if entry is not None and index not in markers and entry.get("path") in removable:
+                    continue  # 彻底删掉的条目：以前写过的都抹掉
+                if entry is not None and index in markers and purged.get(entry.get("path")):
+                    marker = dict(entry)
+                    marker["purged"] = sorted(purged[entry["path"]])
+                    kept.append((marker, json.dumps(marker, ensure_ascii=False)))
+                    continue
+                kept.append((entry, line))
+
+            removed = len(entries) - len(kept)
+            if removed:
+                temp = "{}.tmp".format(self.path)
+                with open(temp, "w", encoding="utf-8") as handle:
+                    for _entry, line in kept:
+                        handle.write(line + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp, self.path)
+                self._rebuild(kept)
+            return {"removed": removed, "kept": len(kept), "paths": len(removable)}
+
+    def _rebuild(self, kept):
+        """日志整理过之后重算内存索引。序号保持原值（最后一个行永远会被留下，
+        因此 latest_seq 不变），各设备记的游标照旧能用。"""
+        self.latest_seq = 0
+        self.op_ids = {}
+        self.files = {}
+        self.deleted = {}
+        self.deleted_by = {}
+        self.count = 0
+        # self.holds 不动：那是「已领走、等条目落盘」的内存占位，与日志无关
+        for entry, _line in kept:
+            if entry:
+                self._index(entry)
+
+    def claim_recyclable(self, device, kind="", count=1, since=None):
+        """把回收池里最近删掉的那几个 ID 交给调用方，并在服务端把它们占住：
+        两台设备同时新建时不会领到同一个 ID。同类型的优先（笔记的 ID 给笔记用），
+        池子里没有同类型就从别的类型里匀——ID 本来就是笔记与待办共用的一套。
+
+        since 是调用方「已应用到第几号」：别的设备只发序号不晚于它的 ID，
+        那些设备肯定已经重放过那条删除，不会出现刚用回收的 ID 建的条目
+        被自己还没拉到的删除又擦掉；发起删除的那一台不必等序号，
+        它本地那份早就删掉了，删完就能直接把 ID 拿去新建。
+        没发出去的条数当 pending 报回去，客户端同步一次之后再来取就有了。"""
+        count = max(1, min(int(count), RECYCLE_CLAIM_MAX))
+        device = str(device or "")
+        with self.lock:
+            pool = self._recyclable()
+            if kind:
+                same_kind = [item for item in pool if item["kind"] == kind]
+                if same_kind:
+                    pool = same_kind
+            if since is None:
+                ready = pool
+            else:
+                ready = [item for item in pool
+                         if item["seq"] <= int(since) or (device and item["device"] == device)]
+            picked = ready[:count]
+            until = now_ms() + RECYCLE_HOLD_SECONDS * 1000
+            for item in picked:
+                self.holds[item["path"]] = {"device": device, "until": until}
+            return picked, len(pool) - len(picked)
+
     def state(self):
-        return {
-            "latestSeq": self.latest_seq,
-            "count": self.count,
-            "files": self.files,
-            "deleted": self.deleted,
-        }
+        with self.lock:
+            return {
+                "latestSeq": self.latest_seq,
+                "count": self.count,
+                "files": dict(self.files),
+                "deleted": dict(self.deleted),
+                # 删除腾出来的、能给新建条目再用的 ID 有多少个
+                "recyclable": len(self._recyclable()),
+            }
 
     def summary(self):
         exists = os.path.isfile(self.path)
@@ -482,12 +675,15 @@ class Journal:
             except OSError:
                 size = 0
                 updated_at = 0
+        with self.lock:
+            recyclable = len(self._recyclable())
         return {
             "journalId": self.journal_id,
             "latestSeq": self.latest_seq,
             "ops": self.count,
             "files": len(self.files),
             "deleted": len(self.deleted),
+            "recyclable": recyclable,
             "size": size,
             "updatedAt": updated_at,
             "exists": exists,
@@ -747,6 +943,13 @@ class ApiHandler(BaseHTTPRequestHandler):
             })
             return
 
+        # 可复用 ID：被删除的条目腾出来的 ID（最近删掉的排在前面），供新建的条目领取
+        if parsed.path == SYNC_PATH + "/ids":
+            limit = parse_int((query.get("limit") or [""])[0], RECYCLE_POOL_LIMIT, 1, RECYCLE_POOL_LIMIT)
+            pool = self.journal.recyclable(limit)
+            self._send(200, {"ok": True, "count": len(pool), "ids": pool})
+            return
+
         if parsed.path == SYNC_PATH + "/state":
             state = self.journal.state()
             state["ok"] = True
@@ -806,6 +1009,15 @@ class ApiHandler(BaseHTTPRequestHandler):
             if record.get("id"):
                 self.admin.note_token_use(record, str(payload.get("device") or ""))
 
+            # 彻底删除（del）之后，这条路径的正文历史不必再留在日志里：只留那一条删除标记
+            deleted_paths = [raw.get("path") for raw in payload["ops"]
+                             if isinstance(raw, dict) and raw.get("op") == "del"]
+            if deleted_paths:
+                compacted = self.journal.compact(deleted_paths)
+                if compacted["removed"]:
+                    log("INFO", "Journal", "彻底删除后整理日志: 抹掉 {} 行，保留 {} 行".format(
+                        compacted["removed"], compacted["kept"]))
+
             rejected = [item for item in accepted if item.get("error")]
             self._send(200, {
                 "ok": not rejected,
@@ -813,6 +1025,25 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "latestSeq": self.journal.latest_seq,
                 "accepted": accepted,
             })
+            return
+
+        # 新建条目时领一个可复用的 ID：服务端把领走的占住一会儿，
+        # 免得两台设备同时新建时拿到同一个 ID（占位在条目被创建或超时后失效）
+        if parsed.path == SYNC_PATH + "/ids/claim":
+            payload = self._read_json() or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            kind = str(payload.get("kind") or "")
+            if kind not in ("notes", "todos"):
+                kind = ""
+            count = parse_int(payload.get("count"), 1, 1, RECYCLE_CLAIM_MAX)
+            # since 缺省时不筛：只发该设备确认已经重放过删除的那些 ID（不过滤则全部可领）
+            since = payload.get("since")
+            if since is not None:
+                since = parse_int(since, 0, 0, 2 ** 62)
+            device = str(payload.get("device") or record.get("device") or "")
+            picked, pending = self.journal.claim_recyclable(device, kind, count, since)
+            self._send(200, {"ok": True, "count": len(picked), "pending": pending, "ids": picked})
             return
 
         self._send(404, {"ok": False, "error": "未知接口"})
@@ -927,6 +1158,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(404, {"ok": False, "error": "找不到该令牌"})
                 return
             self._send(200, {"ok": True, "tokens": self.admin.list_tokens()})
+            return
+
+        # 整理日志：把已彻底删除的路径的正文历史抹掉，只留删除标记（序号不变）
+        if path == API_PREFIX + "/journal/compact":
+            compacted = self.journal.compact()
+            compacted["ok"] = True
+            compacted["journal"] = self.journal.summary()
+            self._send(200, compacted)
             return
 
         self._send(404, {"ok": False, "error": "未知接口"})
@@ -1071,7 +1310,25 @@ def selftest():
         check("重复提交同一条 opId 不重复写", body["accepted"][0].get("duplicate") is True and body["latestSeq"] == 3, repr(body))
 
         status, body = get(sync + "/ops?since=0")
-        check("拉取全部操作", len(body["ops"]) == 3 and body["ops"][0]["seq"] == 1, repr(body)[:200])
+        check("拉取全部操作", len(body["ops"]) == 2 and [item["seq"] for item in body["ops"]] == [1, 3],
+              repr(body)[:200])
+        check("彻底删除之后：日志里不再留它的正文，只剩一条删除标记",
+              body["ops"][-1]["op"] == "del" and "data" not in body["ops"][-1]
+              and all(item["path"] != "notes/two.md" or item["op"] == "del" for item in body["ops"]),
+              repr(body["ops"])[:200])
+
+        # 被抹掉的那条 put 的操作号记在删除标记上：断线重试同一个 opId 仍然算「收过」，不会把内容写回来
+        status, body = post(sync + "/ops", {
+            "device": "dev-a",
+            "ops": [{"opId": "a-2", "op": "put", "path": "notes/two.md", "data": "第二篇",
+                     "hash": sha256_text("第二篇"), "time": 1001}],
+        })
+        check("整理日志之后，重试被抹掉的那条操作仍然算重复",
+              status == 200 and body["accepted"][0].get("duplicate") is True and body["latestSeq"] == 3,
+              repr(body))
+        status, body = get(sync + "/state")
+        check("重试被抹掉的操作不会把已删除的文件写回来",
+              "notes/two.md" not in body["files"] and body["deleted"].get("notes/two.md") == 3, repr(body))
 
         status, body = get(sync + "/ops?since=2")
         check("since 之后只回传新操作", [item["seq"] for item in body["ops"]] == [3], repr(body))
@@ -1079,6 +1336,23 @@ def selftest():
         status, body = get(sync + "/state")
         check("state 里只留存活文件", list(body["files"].keys()) == ["notes/one.md"], repr(body["files"]))
         check("state 里保留删除记录", body["deleted"].get("notes/two.md") == 3, repr(body["deleted"]))
+        check("state 报出可复用 ID 的数量", body.get("recyclable") == 1, repr(body.get("recyclable")))
+
+        status, body = get(sync + "/ids")
+        check("可复用 ID 就是刚被删掉的那一条",
+              status == 200 and body.get("count") == 1 and [item["id"] for item in body["ids"]] == ["two"],
+              repr(body))
+
+        status, body = post(sync + "/ids/claim", {"device": "dev-b", "kind": "notes", "count": 1, "since": 3})
+        check("新建条目时能领回被删掉的 ID",
+              status == 200 and [item["id"] for item in body["ids"]] == ["two"], repr(body))
+
+        status, body = post(sync + "/ids/claim", {"device": "dev-c", "kind": "notes", "count": 1, "since": 3})
+        check("已领走的 ID 不会同时发给另一台设备", status == 200 and body["ids"] == [], repr(body))
+
+        status, body = post(sync + "/ids/claim", {"device": "dev-d", "kind": "notes", "count": 1, "since": 2})
+        check("序号还没跟上的设备先不发，并把它当成待同步",
+              status == 200 and body["ids"] == [] and body["pending"] == 1, repr(body))
 
         status, body = get(sync + "/file?path=notes/one.md")
         check("能重放出文件内容", status == 200 and body["data"] == "第一篇", repr(body))
@@ -1146,7 +1420,7 @@ def selftest():
 
         status, body = get(API_PREFIX + "/journal", token=None, cookie=True)
         check("日志概览：操作数、存活文件与删除记录",
-              status == 200 and body.get("ops") == 3 and body.get("files") == 1
+              status == 200 and body.get("ops") == 2 and body.get("files") == 1
               and body.get("deleted") == 1 and body.get("latestSeq") == 3
               and body.get("size") > 0 and body.get("exists") is True, repr(body))
 
@@ -1158,7 +1432,7 @@ def selftest():
         disposition = headers.get("Content-Disposition") or ""
         check("下载日志：附件名与内容都是完整的操作行",
               status == 200 and "attachment" in disposition and 'filename="esprin-journal-' in disposition
-              and len(lines) == 3 and _json.loads(lines[-1]).get("seq") == 3, repr(text)[:160])
+              and len(lines) == 2 and _json.loads(lines[-1]).get("seq") == 3, repr(text)[:160])
 
         status, body = get(sync + "/state", token=None, cookie=True)
         check("同源管理后台持登录态可读同步接口", status == 200 and "files" in body, repr(body)[:120])
@@ -1272,11 +1546,106 @@ def selftest():
         check("删除记录一致", reloaded.deleted.get("notes/two.md") == 3, repr(reloaded.deleted))
         check("重启后仍能续写", reloaded.append_many("dev-a", [{"opId": "a-4", "op": "put", "path": "notes/three.md", "data": "3"}])[0]["seq"] == 5)
 
+        log("INFO", "Selftest", "section=recycle-ids")
+        pool = Journal(os.path.join(tmp, "recycle-data"))
+        pool.append_many("dev-a", [
+            {"opId": "c-1", "op": "put", "path": "notes/123.md", "data": "一篇文章"},
+            {"opId": "c-2", "op": "del", "path": "notes/123.md"},
+        ])
+        check("删除：留下删除记录、拿掉存活索引",
+              pool.deleted.get("notes/123.md") == 2 and "notes/123.md" not in pool.files, repr(pool.state()))
+        check("被删掉的 ID 进入回收池", [item["id"] for item in pool.recyclable()] == ["123"], repr(pool.recyclable()))
+
+        first, pending = pool.claim_recyclable("dev-b", "notes", 1)
+        second, _pending = pool.claim_recyclable("dev-c", "notes", 1)
+        check("领走之后不再重复发放",
+              [item["id"] for item in first] == ["123"] and second == [], f"{first}/{second}")
+
+        pool.append_many("dev-a", [
+            {"opId": "c-2b", "op": "put", "path": "notes/123.md", "data": "又建了一篇"},
+            {"opId": "c-2c", "op": "del", "path": "notes/123.md"},
+        ])
+        behind, behind_pending = pool.claim_recyclable("dev-d", "notes", 1, 3)
+        check("序号没跟上的设备先不发（发行时再拉一次日志就有了）",
+              behind == [] and behind_pending == 1, f"{behind}/{behind_pending}")
+        caught_up, _pending = pool.claim_recyclable("dev-d", "notes", 1, 5)
+        check("序号跟上了就能领到", [item["id"] for item in caught_up] == ["123"], repr(caught_up))
+
+        pool.append_many("dev-b", [{"opId": "c-3", "op": "put", "path": "notes/123.md", "data": "用同一个 ID 新建的一篇"}])
+        check("用回收的 ID 新建后：删除记录撤销、ID 不再可复用",
+              "notes/123.md" not in pool.deleted and "notes/123.md" in pool.files
+              and pool.recyclable() == [] and pool.state()["recyclable"] == 0, repr(pool.state()))
+
+        # 再删一次，这次由 dev-a 删：它自己不必等序号跟上就能把 ID 领回去，别的设备仍旧要等
+        pool.append_many("dev-a", [{"opId": "c-3b", "op": "del", "path": "notes/123.md"}])
+        own, _own_pending = pool.claim_recyclable("dev-a", "notes", 1, 0)
+        check("发起删除的设备不必等自己的序号跟上就能领回这个 ID",
+              [item["id"] for item in own] == ["123"], repr(own))
+        others, others_pending = pool.claim_recyclable("dev-z", "notes", 1, 0)
+        check("其他设备还是要等序号跟上", others == [] and others_pending == 1, f"{others}/{others_pending}")
+
+        pool.append_many("dev-a", [
+            {"opId": "c-4", "op": "put", "path": "notes/123.md", "data": "再建一次"},
+            {"opId": "c-5", "op": "put", "path": "config.json", "data": "{}"},
+            {"opId": "c-6", "op": "del", "path": "config.json"},
+        ])
+        check("回收池只认 notes/ 与 todos/ 下的条目",
+              pool.recyclable() == [] and pool.deleted.get("config.json") == 9, repr(pool.state()))
+        check("整理日志：非条目的路径也一样处理（只留删除标记）",
+              pool.compact()["removed"] == 1 and pool.deleted.get("config.json") == 9
+              and pool.latest_seq == 9, repr(pool.state()))
+
+        log("INFO", "Selftest", "section=compact-journal")
+        trim = Journal(os.path.join(tmp, "compact-data"))
+        trim.append_many("dev-a", [
+            {"opId": "t-1", "op": "put", "path": "notes/keep.md", "data": "活着的一篇"},
+            {"opId": "t-2", "op": "put", "path": "notes/keep.md", "data": "活着的一篇（改过一版）"},
+            {"opId": "t-3", "op": "put", "path": "notes/gone.md", "data": "要被彻底删掉的正文"},
+            {"opId": "t-4", "op": "del", "path": "notes/gone.md"},
+        ])
+        compacted = trim.compact()
+        with open(trim.path, "r", encoding="utf-8") as handle:
+            trimmed_text = handle.read()
+        check("整理日志：已彻底删除的那一条只剩删除标记，正文不再留在日志里",
+              compacted["removed"] == 1 and "要被彻底删掉的正文" not in trimmed_text
+              and "notes/gone.md" in trimmed_text, repr(compacted))
+        check("整理日志：还活着的条目历史一行不动", trimmed_text.count("notes/keep.md") == 2, trimmed_text[:200])
+        check("整理之后状态不变：序号、存活文件、删除记录、回收池",
+              trim.latest_seq == 4 and sorted(trim.files.keys()) == ["notes/keep.md"]
+              and trim.deleted.get("notes/gone.md") == 4
+              and [item["id"] for item in trim.recyclable()] == ["gone"], repr(trim.state()))
+        check("序号留了空洞也照样能按 since 增量拉",
+              [item["seq"] for item in trim.read_ops(0, 10)] == [1, 2, 4]
+              and [item["seq"] for item in trim.read_ops(2, 10)] == [4], repr(trim.read_ops(0, 10)))
+        check("只整理指定路径：还有后续的路径不会被动",
+              trim.compact(["notes/keep.md"])["removed"] == 0, repr(trim.state()))
+        check("整理过的日志重启后重建一致",
+              Journal(os.path.join(tmp, "compact-data")).deleted.get("notes/gone.md") == 4, repr(trim.state()))
+        check("整理之后还能照常往下写",
+              trim.append_many("dev-a", [{"opId": "t-5", "op": "put", "path": "notes/later.md", "data": "后来的"}])[0]["seq"] == 5,
+              repr(trim.state()))
+
+        # 又用同一个 ID 建了一篇、再彻底删掉：删除标记合并，以前记下的操作号不会丢
+        trim.append_many("dev-a", [
+            {"opId": "t-6", "op": "put", "path": "notes/gone.md", "data": "又建了一篇"},
+            {"opId": "t-7", "op": "del", "path": "notes/gone.md"},
+        ])
+        trim.compact()
+        with open(trim.path, "r", encoding="utf-8") as handle:
+            again = handle.read()
+        check("再删一次：新写的正文同样被抹掉",
+              "又建了一篇" not in again and "要被彻底删掉的正文" not in again, again[:240])
+        check("整理后的删除标记仍然认得重试的操作号",
+              trim.latest_seq == 6 and trim.op_ids.get("t-3") == 6 and trim.op_ids.get("t-6") == 6,
+              repr(trim.op_ids))
+
         blank = Journal(os.path.join(tmp, "blank-data"))
         blank_summary = blank.summary()
         check("空日志的概览：还没有任何操作",
               blank_summary["ops"] == 0 and blank_summary["size"] == 0 and blank_summary["exists"] is False,
               repr(blank_summary))
+        check("空日志里没有可复用的 ID",
+              blank.recyclable() == [] and blank_summary["recyclable"] == 0, repr(blank_summary))
 
         log("INFO", "Selftest", "section=reload-admin")
         reloaded_admin = AdminStore(data_dir)

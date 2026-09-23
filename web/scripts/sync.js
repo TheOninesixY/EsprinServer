@@ -15,6 +15,10 @@ const ADMIN_LOGOUT_PATH = '/admin/api/logout';
 const PAGE_LIMIT = 500;
 const REQUEST_TIMEOUT_MS = 15000;
 const PUSH_DEBOUNCE_MS = 800;
+/* 可复用 ID：条目被删除后 ID 会回到服务端的回收池，新建条目时领一个来用。
+   一次多领一两个，连着我新建也能用上；领了没用上的会在服务端超时自动回到池子。 */
+const RECYCLE_CLAIM_PATH = `${SYNC_PATH}/ids/claim`;
+const RECYCLE_CLAIM_COUNT = 2;
 const AUTO_SYNC_PRESETS = { off: 0, '5s': 5, '1m': 60, '5m': 300, startup: 0 };
 
 /* ---------------- SHA-256 ----------------
@@ -129,6 +133,11 @@ const Sync = {
     connection: 'idle',
     connectionMessage: '',
     serverInfo: null,
+    // 从服务端领回来的可复用 ID（删除腾出来的 ID，新建条目优先取用）
+    recycledIds: [],
+    // 本机刚彻底删掉的条目腾出来的 ID：最优先（服务端那边随后也会把它收进回收池）
+    locallyFreedIds: [],
+    recycling: false,
 
     init() {
         this.readOutbox();
@@ -210,6 +219,8 @@ const Sync = {
         this.connection = 'ready';
         this.connectionMessage = '';
         this.renderIndicator();
+        // 连接就绪：先把可复用的 ID 领一批，之后新建条目就能直接用上
+        this.refillRecycledIds().catch(() => {});
         return result;
     },
 
@@ -295,9 +306,28 @@ const Sync = {
             ? { opId: this.makeOpId(), op: 'del', path, time: Date.now() }
             : this.buildPutOp(path);
         if (!op) return;
+        // 彻底删除：这个 ID 本地立刻就能再用（服务端那边随后把它收进回收池），
+        // 下一次新建的条目会直接用它，不必等一次同步往返
+        if (kind === 'del') this.releaseRecycledId(path);
         this.mergeOp(op);
         this.schedulePush();
         this.renderIndicator('pending');
+    },
+
+    // 本地刚删掉的条目：把它的 ID 放进本地清单（最优先，不必等同步往返）
+    releaseRecycledId(path) {
+        const match = /^(notes|todos)\/([A-Za-z0-9_-]{1,64})\.md$/.exec(String(path || ''));
+        if (!match) return;
+        const entry = { id: match[2], kind: match[1], path: String(path) };
+        this.locallyFreedIds = [entry].concat(this.locallyFreedIds.filter((item) => item.id !== entry.id));
+    },
+
+    // 从一份清单里取一个 ID：优先同类型，没有同类型就取队首；取走即从清单里移除
+    takePoolId(list, prefix) {
+        if (!list.length) return '';
+        const sameKind = list.findIndex((item) => item.kind === prefix);
+        const entry = list.splice(sameKind === -1 ? 0 : sameKind, 1)[0];
+        return entry ? String(entry.id) : '';
     },
 
     buildPutOp(path) {
@@ -442,11 +472,42 @@ const Sync = {
             since = State.sync.lastSeq;
         }
 
-        if (changed) {
+        // 拉取游标已经越过自推的那些序号：服务端不会再发下来，记着也没用
+        const pruned = this.pruneSelfPushed();
+        if (changed || pruned) {
             State.sync.lastSeq = Math.max(State.sync.lastSeq, 0);
             saveConfig();
         }
         return { ok: true, applied, scanned, changed };
+    },
+
+    /* ---------------- 自推的操作序号 ----------------
+
+       本机推上去、服务端已受理的操作序号。两处用到：重放时跳过它们（本地早就落盘了，
+       再应用一遍只会把后来的内容冲掉）；拉取游标越过的就丢掉（服务端不会再发下来）。 */
+    isSelfPushed(seq) {
+        const value = Math.round(Number(seq) || 0);
+        return value > 0 && (State.sync.selfPushed || []).includes(value);
+    },
+
+    rememberSelfPushed(seqs) {
+        const merged = new Set((State.sync.selfPushed || []).map((value) => Math.round(Number(value))));
+        seqs.forEach((seq) => {
+            const value = Math.round(Number(seq) || 0);
+            if (value > 0) merged.add(value);
+        });
+        State.sync.selfPushed = [...merged]
+            .filter((seq) => seq > (State.sync.lastSeq || 0))
+            .sort((a, b) => a - b);
+        saveConfig();
+    },
+
+    // 拉取游标已经越过的自推序号可以丢掉了
+    pruneSelfPushed() {
+        const kept = (State.sync.selfPushed || []).filter((seq) => seq > (State.sync.lastSeq || 0));
+        if (kept.length === (State.sync.selfPushed || []).length) return false;
+        State.sync.selfPushed = kept;
+        return true;
     },
 
     // 应用一条远端操作：只认 notes/ 与 todos/ 下的 Markdown，
@@ -455,6 +516,10 @@ const Sync = {
         const path = String(op && op.path ? op.path : '');
         if (!path.startsWith('notes/') && !path.startsWith('todos/')) return false;
         if (!path.endsWith('.md')) return false;
+        // 本机自己推上去的操作不必再应用一遍：本地早就落盘了。
+        // 彻底删掉一个条目、又用回收的 ID 新建之后，本机很可能还没拉到自己那条删除，
+        // 重放它就会把刚新建的条目删掉——这条跳过就是为此。
+        if (this.isSelfPushed(op.seq)) return false;
         if (this.pendingFor(path)) return false;
 
         if (op.op === 'del') {
@@ -495,6 +560,10 @@ const Sync = {
         }
 
         const accepted = Array.isArray(result.data.accepted) ? result.data.accepted : [];
+        // 服务端受理的序号记下来：重放时跳过这些操作（见 applyRemoteOp）
+        this.rememberSelfPushed(accepted
+            .filter((item) => item && !item.error && Number(item.seq) > 0)
+            .map((item) => Number(item.seq)));
         const failedIds = new Set(accepted.filter((item) => item && item.error).map((item) => item.opId));
         const sentIds = new Set(batch.map((item) => item.opId));
         const before = this.outbox.length;
@@ -513,7 +582,62 @@ const Sync = {
         if (this.outbox.length) {
             return { ok: false, error: this.lastError || '部分改动未能推送', pushed: before - this.outbox.length, remaining: this.outbox.length };
         }
+        // 刚推上去的删除把那个 ID 交回了服务端的回收池：顺手补一批可复用 ID
+        if (batch.some((op) => op.op === 'del' && !failedIds.has(op.opId))) this.refillRecycledIds().catch(() => {});
         return { ok: true, pushed: batch.length, remaining: 0 };
+    },
+
+    /* ---------------- 可复用 ID ---------------- */
+
+    /* 条目被删除后，它的 ID 会回到服务端的回收池（删除记录仍留着，别处的老副本不会被推回来）。
+       新建条目时优先领一个来用：被删掉的那一条腾出来的 ID 会重新落到新建的条目上。
+       服务端会把领走的 ID 占住一会儿，所以两台设备同时新建也不会撞到同一个。 */
+    async refillRecycledIds(retry = true) {
+        if (!State.sync.enabled || this.recycling) return { ok: false };
+        this.recycling = true;
+        try {
+            const claim = () => this.apiRequest('POST', RECYCLE_CLAIM_PATH, {
+                device: this.deviceId(),
+                count: RECYCLE_CLAIM_COUNT,
+                // 只领「本机已经重放过那条删除」的 ID：否则新建好的条目会被自己还没拉到的删除擦掉
+                since: State.sync.lastSeq
+            }, 8000);
+
+            let result = await claim();
+            // 池子里有 ID，但本机还没重放过对应的删除：先同步一次，再领一遍就有了
+            if (result.ok && retry && !(result.data.ids || []).length && Number(result.data.pending) > 0) {
+                const synced = await this.syncNow({ reason: '回收 ID' });
+                if (synced.ok) result = await claim();
+            }
+            if (!result.ok) return { ok: false, error: result.error };
+
+            const ids = Array.isArray(result.data.ids) ? result.data.ids : [];
+            // 服务端可能给出本机还在用着的 ID（本地那一条还没被删掉）：这类丢掉，别拿它去建新条目
+            const usable = ids.filter((item) => item && item.id && !FileStore.memory.has(String(item.path)));
+            // 领到新的就换上；服务端这次没有可发的，手里那几个先留着（它们在服务端仍然被占着）
+            if (usable.length) this.recycledIds = usable;
+            return { ok: true, count: this.recycledIds.length };
+        } finally {
+            this.recycling = false;
+        }
+    },
+
+    // 取一个回收来的 ID：优先同类型（笔记的给笔记、待办的给待办），没有就退而求其次
+    takeRecycledId(kind) {
+        const prefix = kind === 'todo' ? TODO_DIR : NOTE_DIR;
+        // 本机刚彻底删掉的那几个最优先：本地确信那一条已经删干净了
+        const local = this.takePoolId(this.locallyFreedIds, prefix);
+        if (local) return local;
+
+        if (!this.recycledIds.length) {
+            // 手里没存货：先补一批（这一次新建先按老办法随机生成，不在这里顺带做一次同步）
+            this.refillRecycledIds(false).catch(() => {});
+            return '';
+        }
+        const id = this.takePoolId(this.recycledIds, prefix);
+        // 池子见底就顺手补一批，下一次新建仍然能拿到回收的 ID
+        if (!this.recycledIds.length) this.refillRecycledIds().catch(() => {});
+        return id;
     },
 
     /* ---------------- 组合动作 ---------------- */

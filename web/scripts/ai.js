@@ -574,7 +574,7 @@ function saveAiAnswerAsNote(msg) {
     const title = (msg.content || '').split(/\r?\n/).find((line) => line.trim()) || 'AI 回答';
     const now = Date.now();
     const item = {
-        id: generateUniqueItemId(),
+        id: generateUniqueItemId('note'),
         title: title.replace(/^#+\s*/, '').slice(0, 60),
         content: msg.content || '',
         folder: DEFAULT_FOLDER,
@@ -1163,7 +1163,7 @@ async function executeAiAgentTool(name, args) {
         const folder = State.folders.includes(String(input.folder || '').trim()) ? String(input.folder).trim() : DEFAULT_FOLDER;
         const now = Date.now();
         const item = {
-            id: generateUniqueItemId(),
+            id: generateUniqueItemId('note'),
             title: String(input.title || '').trim(),
             content: String(input.content || ''),
             folder,

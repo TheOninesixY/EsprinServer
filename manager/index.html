@@ -112,11 +112,12 @@
                 <div class="settings-row is-column">
                     <div class="settings-row-info">
                         <span class="settings-row-label">文件日志</span>
-                        <span class="settings-row-desc">同步的全部内容都追加写在这一份日志里（数据目录下的 journal.log，一行一条 put / del 操作，只增不改）：把日志从头重放一遍就是当前全部数据，删除也是一条记录。下载下来可以留档，也可以拿到 EsprinNemo 的「设置 → 数据与存储 → 文件日志」里导入还原，或摊成一个文件夹</span>
+                        <span class="settings-row-desc">同步的全部内容都写在这一份日志里（数据目录下的 journal.log，一行一条 put / del 操作）：把日志从头重放一遍就是当前全部数据，删除也是一条记录。条目被<strong>彻底删除</strong>后，日志里只留一条删除标记（别的设备靠它知道这个文件已删、不会把老副本推回来），它以前写过什么会随即被抹掉；「整理日志」可以把积压的旧记录一并清掉。下载下来可以留档，也可以拿到 EsprinNemo 的「设置 → 数据与存储 → 文件日志」里导入还原，或摊成一个文件夹</span>
                         <code class="journal-meta" id="journal-summary">正在读取日志…</code>
                     </div>
                     <div class="settings-actions">
                         <button class="settings-btn" id="journal-refresh" type="button">刷新</button>
+                        <button class="settings-btn" id="journal-compact" type="button" disabled>整理日志</button>
                         <button class="settings-btn primary" id="journal-download" type="button" disabled>下载日志</button>
                     </div>
                 </div>

@@ -48,7 +48,7 @@ function buildNewItem(isTodo) {
     const defaults = newItemDefaults();
     const now = Date.now();
     const item = {
-        id: generateUniqueItemId(),
+        id: generateUniqueItemId(isTodo ? 'todo' : 'note'),
         title: '',
         content: '',
         folder: State.folders.includes(defaults.folder) ? defaults.folder : DEFAULT_FOLDER,
@@ -442,7 +442,7 @@ async function importFiles(fileList) {
             const metaFolder = meta ? readMetaString(meta.folder) : '';
             const metaTags = meta ? readMetaTags(meta.tags) : [];
             const item = {
-                id: generateUniqueItemId(),
+                id: generateUniqueItemId('note'),
                 // 标题优先级：文件内注释 > 文件名 > 正文首个非空行
                 title: (meta ? readMetaString(meta.title) : '')
                     || file.name.replace(/\.[^.]+$/, '').trim()

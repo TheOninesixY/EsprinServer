@@ -506,6 +506,10 @@ html.modern-layout {
     html.modern-layout .settings-view .settings-header {
         padding-top: 16px;
     }
+    /* 顶端渐隐（见 styles/settings.css）跟着上内边距收窄：16px 的留白里放不下 32px 的渐隐 */
+    .settings-content {
+        --settings-top-inset: 16px;
+    }
     .settings-row {
         flex-direction: column;
         align-items: stretch;

@@ -84,7 +84,9 @@ const State = {
         lastSeq: 0,
         journalId: '',
         lastSyncAt: 0,
-        lastSyncSummary: ''
+        lastSyncSummary: '',
+        // 本机推上去、服务端已受理的操作序号：重放时跳过它们（见 sync.js 的 applyRemoteOp）
+        selfPushed: []
     },
     saveTimer: null,
     previewTimer: null
@@ -439,10 +441,22 @@ function generateItemId() {
     return Array.from(bytes, (byte) => chars.charAt(byte % chars.length)).join('');
 }
 
-function generateUniqueItemId() {
+function generateUniqueItemId(kind) {
+    // 优先用服务端回收池里的 ID：被删掉的那一条腾出来的 ID 会重新落到新建的条目上
+    // （池子在 scripts/sync.js 里维护，未接入同步时为空）
+    const recycled = typeof Sync !== 'undefined' && Sync ? String(Sync.takeRecycledId(kind) || '') : '';
+    if (recycled && !isItemIdTaken(recycled)) return recycled;
+
     let id = generateItemId();
-    while (getItemById(id)) id = generateItemId();
+    while (isItemIdTaken(id)) id = generateItemId();
     return id;
+}
+
+// 这个 ID 是不是还有人在用：内存里的条目与本地文件（notes/、todos/ 共用一个 ID 空间）都算
+function isItemIdTaken(id) {
+    if (!id) return true;
+    if (getItemById(id)) return true;
+    return FileStore.memory.has(`${NOTE_DIR}/${id}.md`) || FileStore.memory.has(`${TODO_DIR}/${id}.md`);
 }
 
 // .md 文件 → 条目对象
@@ -580,7 +594,8 @@ function saveConfig() {
             lastSeq: State.sync.lastSeq,
             journalId: State.sync.journalId,
             lastSyncAt: State.sync.lastSyncAt,
-            lastSyncSummary: State.sync.lastSyncSummary
+            lastSyncSummary: State.sync.lastSyncSummary,
+            selfPushed: State.sync.selfPushed
         }
     };
     try {
@@ -641,6 +656,11 @@ function loadConfig() {
     State.sync.journalId = typeof sync.journalId === 'string' ? sync.journalId : '';
     State.sync.lastSyncAt = Number(sync.lastSyncAt) || 0;
     State.sync.lastSyncSummary = typeof sync.lastSyncSummary === 'string' ? sync.lastSyncSummary : '';
+    State.sync.selfPushed = Array.isArray(sync.selfPushed)
+        ? sync.selfPushed
+            .map((value) => Math.round(Number(value)))
+            .filter((value) => Number.isFinite(value) && value > 0)
+        : [];
 }
 
 /* ---------------- 列表过滤与搜索 ---------------- */
@@ -847,6 +867,8 @@ async function clearAllData() {
     Sync.outbox = [];
     Sync.writeOutbox();
     State.sync.lastSeq = 0;
+    // 自推序号跟着作废：清空之后本地的副本全没了，重放反而得如实应用
+    State.sync.selfPushed = [];
     State.sync.lastSyncAt = 0;
     State.sync.lastSyncSummary = '';
     saveConfig();

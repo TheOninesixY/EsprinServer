@@ -37,6 +37,37 @@
     flex-direction: column;
     gap: 24px;
 }
+
+/* ---------------- 内容区顶端的渐隐 ----------------
+   设置页只有这一列在滚（分类导航自己一份），内容顶到上沿时会被硬切一刀；
+   这里在顶端垫一条渐隐，滚上去的内容淡出，而不是突然断掉。
+   宽度取内容区上方的留白（--settings-top-inset，就是内容区自己的上内边距）：
+   不滚动时那一带本来就没有内容，因此这条渐隐常驻即可，不必由脚本判定滚动位置；
+   宽度取这一档也正合适：滚出去的行淡尽的位置，正是它未滚动时站着的位置。
+   竖屏下上内边距收到 16px，渐隐跟着收窄（见 styles/web.css）。
+   用 mask 而不是盖一层渐变浮层：mask 只看 alpha，不挑底色，也不必跟着主题色、
+   右侧走廊（见 styles/mode.css）与全屏时的收窄重新算一遍——
+   与标签栏两端那两条是同一套做法。 */
+.settings-content {
+    /* 内容区上方的留白：渐隐按它淡出，竖屏下改小（见 styles/web.css） */
+    --settings-top-inset: 32px;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 var(--settings-top-inset));
+    mask-image: linear-gradient(to bottom, transparent 0, #000 var(--settings-top-inset));
+}
+
+/* ---------------- 设置页不显示滚动条 ----------------
+   两列都照旧可滚（滚轮、触控板、键盘），只是不再画出那条 6px 的细条（见 base.css）：
+   设置页是整屏铺开的静态页面，常驻的滚动条像一道多出来的边框，
+   而内容被上沿截断的那一头由上面那条渐隐交代。
+   竖屏下分类导航是一条横向滚动的条（见 styles/web.css），这道条一并去掉。 */
+.settings-sidebar,
+.settings-content {
+    scrollbar-width: none;
+}
+.settings-sidebar::-webkit-scrollbar,
+.settings-content::-webkit-scrollbar {
+    display: none;
+}
 .settings-panel {
     display: flex;
     flex-direction: column;

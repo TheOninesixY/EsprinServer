@@ -139,7 +139,7 @@ function saveScratchpadAsNote() {
 
     const now = Date.now();
     const note = {
-        id: generateUniqueItemId(),
+        id: generateUniqueItemId('note'),
         title: values.title.trim() || deriveTitle(values.content) || '小本本',
         content: values.content,
         folder: DEFAULT_FOLDER,
