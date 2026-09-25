@@ -1,4 +1,4 @@
-const API_BASE = '/api';
+const API_BASE = '/admin/api';
 
 const $ = (id) => document.getElementById(id);
 
@@ -150,26 +150,43 @@ async function api(path, body) {
 const state = {
     passwordSet: false,
     loggedIn: false,
+    admin: false,
+    // 当前登录的账户（任何账户登录都会填上，管理面板只对管理员展示）
+    user: null,
+    accountCount: 0,
     tokenCount: 0,
+    users: [],
+    // 正在管理的账户 id：令牌与日志两节都作用在它上面
+    account: '',
 };
 
 // 数据与日志一节的常驻说明：登录前、出错时都会回到这句
-const JOURNAL_IDLE_HINT = '下载得到的是 journal.log 的当前快照；这台服务器上的全部笔记与待办就在其中。';
+const JOURNAL_IDLE_HINT = '下载得到的是当前账户那份 journal.log 的快照；这个账户的全部笔记与待办就在其中。';
+
+// 管理面板只对管理员账户开放
+function panelReady() {
+    return state.loggedIn && state.admin;
+}
 
 function render() {
     $('view-setup').hidden = state.passwordSet;
-    $('view-login').hidden = !state.passwordSet || state.loggedIn;
-    $('view-panel').hidden = !state.loggedIn;
+    $('view-login').hidden = !state.passwordSet || panelReady();
+    $('view-panel').hidden = !panelReady();
     $('logout-btn').hidden = !state.loggedIn;
 
-    if (state.loggedIn) {
-        $('header-desc').textContent = state.tokenCount > 0
-            ? '管理 ' + state.tokenCount + ' 个访问令牌与它们绑定的设备。令牌明文只在创建或重置的那一瞬间出现，服务端只保存摘要。'
-            : '给每台设备建一个访问令牌，客户端用它同步笔记与待办。令牌明文只在创建时出现一次，服务端只保存摘要。';
+    if (panelReady()) {
+        $('header-desc').textContent = '当前账户 ' + (state.user ? state.user.name : '')
+            + ' · 共 ' + state.accountCount + ' 个账户 · ' + state.tokenCount + ' 个访问令牌。'
+            + '令牌明文只在创建或重置的那一瞬间出现，服务端只保存摘要。';
     } else {
+        if (state.loggedIn && state.user) {
+            setMessage('login-msg', '当前登录的账户「' + state.user.name
+                + '」不是管理员，进不了管理后台。请先退出，再用管理员账户登录。', 'error');
+        }
         $('journal-summary').textContent = '登录后可以查看与下载日志';
         $('journal-summary').title = '';
         $('journal-download').disabled = true;
+        $('journal-compact').disabled = true;
         setMessage('journal-status', JOURNAL_IDLE_HINT);
     }
 }
@@ -178,10 +195,236 @@ async function refresh() {
     const { data } = await api('/status');
     state.passwordSet = !!data.passwordSet;
     state.loggedIn = !!data.loggedIn;
+    state.admin = !!data.admin;
+    state.user = data.user || null;
+    state.accountCount = Number(data.accountCount) || 0;
     state.tokenCount = Number(data.tokenCount) || 0;
     render();
 
-    if (state.loggedIn) {
+    if (!panelReady()) return;
+    await loadUsers();
+    await loadTokens();
+    await loadJournal();
+}
+
+/* ---------------- 账户 ---------------- */
+
+function accountQuery() {
+    return state.account ? '?user=' + encodeURIComponent(state.account) : '';
+}
+
+function accountById(id) {
+    return state.users.find((item) => item.id === id) || null;
+}
+
+function fillAccountSelect() {
+    const select = $('account-select');
+    select.textContent = '';
+    state.users.forEach((record) => {
+        const option = document.createElement('option');
+        option.value = record.id;
+        option.textContent = record.name + (record.admin ? '（管理员）' : '')
+            + (record.enabled ? '' : '（已停用）');
+        select.append(option);
+    });
+    select.value = state.account;
+    if (select.value !== state.account && state.users.length) {
+        state.account = state.users[0].id;
+        select.value = state.account;
+    }
+    renderAccountMeta();
+}
+
+function renderAccountMeta() {
+    const record = accountById(state.account);
+    const meta = $('account-meta');
+    if (!record) {
+        meta.textContent = '';
+        return;
+    }
+    const journal = record.journal || {};
+    meta.textContent = 'id ' + record.id + ' · ' + Number(record.tokenCount) + ' 个令牌'
+        + ' · ' + Number(journal.ops || 0) + ' 条操作 · ' + Number(journal.files || 0)
+        + ' 个存活文件 · ' + formatFileSize(journal.size);
+}
+
+function userRow(record) {
+    const row = document.createElement('div');
+    row.className = 'settings-row token-row';
+
+    const head = document.createElement('div');
+    head.className = 'token-head';
+
+    const role = document.createElement('span');
+    role.className = 'badge';
+    role.textContent = record.builtIn ? '内置账户' : (record.admin ? '管理员' : '普通账户');
+    if (!record.admin) role.dataset.off = '1';
+
+    const name = document.createElement('span');
+    name.className = 'token-name';
+    name.textContent = record.name;
+
+    const actions = document.createElement('span');
+    actions.className = 'settings-actions';
+
+    head.append(role);
+    if (!record.enabled) {
+        const off = document.createElement('span');
+        off.className = 'badge';
+        off.dataset.off = '1';
+        off.textContent = '已停用';
+        head.append(off);
+    }
+    head.append(name, actions);
+
+    const journal = record.journal || {};
+    const meta = document.createElement('div');
+    meta.className = 'token-meta';
+    const metaText = document.createElement('span');
+    metaText.textContent = '创建于 ' + formatTime(record.createdAt) + ' · 最近登录 ' + formatTime(record.lastLoginAt)
+        + ' · ' + Number(record.tokenCount) + ' 个令牌 · ' + Number(journal.ops || 0) + ' 条操作 · '
+        + Number(journal.files || 0) + ' 个存活文件 · ' + formatFileSize(journal.size);
+    meta.append(metaText);
+
+    const fields = document.createElement('div');
+    fields.className = 'row-controls';
+
+    const nameInput = document.createElement('input');
+    nameInput.className = 'settings-input';
+    nameInput.type = 'text';
+    nameInput.maxLength = 32;
+    nameInput.placeholder = '账户名';
+    nameInput.value = record.name;
+    if (record.builtIn) {
+        // 内置账户的名字同时是它的数据目录名，不允许改
+        nameInput.disabled = true;
+        nameInput.title = '内置账户 admin 不能改名';
+    }
+
+    const passwordInput = document.createElement('input');
+    passwordInput.className = 'settings-input';
+    passwordInput.type = 'password';
+    passwordInput.autocomplete = 'new-password';
+    passwordInput.placeholder = '重设密码（至少 8 位）';
+
+    fields.append(nameInput, passwordInput);
+
+    const saveButton = document.createElement('button');
+    saveButton.className = 'settings-btn';
+    saveButton.type = 'button';
+    saveButton.textContent = '保存改名';
+    saveButton.disabled = true;
+    const syncSaveState = () => {
+        saveButton.disabled = record.builtIn || nameInput.value.trim() === record.name;
+    };
+    nameInput.addEventListener('input', syncSaveState);
+    saveButton.addEventListener('click', async () => {
+        const { status, data } = await api('/users/update', { id: record.id, name: nameInput.value.trim() });
+        if (status === 401) return refresh();
+        if (status !== 200) return toast(data.error || '改名失败', 'error');
+        toast('账户名已改为 ' + data.user.name);
+        await reloadUsers();
+    });
+
+    const resetButton = document.createElement('button');
+    resetButton.className = 'settings-btn';
+    resetButton.type = 'button';
+    resetButton.textContent = '重设密码';
+    resetButton.addEventListener('click', async () => {
+        const value = passwordInput.value;
+        if (value.length < 8) return toast('新密码至少 8 位', 'error');
+        const { status, data } = await api('/users/password', { id: record.id, password: value });
+        if (status === 401) return refresh();
+        if (status !== 200) return toast(data.error || '重设失败', 'error');
+        passwordInput.value = '';
+        toast('已重设「' + record.name + '」的密码，该账户已登录的浏览器会退出');
+        await reloadUsers();
+    });
+
+    if (!record.builtIn) {
+        const roleButton = document.createElement('button');
+        roleButton.className = 'settings-btn';
+        roleButton.type = 'button';
+        roleButton.textContent = record.admin ? '取消管理员' : '设为管理员';
+        roleButton.addEventListener('click', async () => {
+            const { status, data } = await api('/users/update', { id: record.id, admin: !record.admin });
+            if (status === 401) return refresh();
+            if (status !== 200) return toast(data.error || '操作失败', 'error');
+            toast(record.admin ? '已取消管理员权限' : '已设为管理员');
+            await reloadUsers();
+        });
+
+        const toggleButton = document.createElement('button');
+        toggleButton.className = 'settings-btn';
+        toggleButton.type = 'button';
+        toggleButton.textContent = record.enabled ? '停用' : '启用';
+        toggleButton.addEventListener('click', async () => {
+            const { status, data } = await api('/users/update', { id: record.id, enabled: !record.enabled });
+            if (status === 401) return refresh();
+            if (status !== 200) return toast(data.error || '操作失败', 'error');
+            toast(record.enabled ? '账户已停用，它的令牌与登录会话都已失效' : '账户已重新启用');
+            await reloadUsers();
+        });
+
+        const deleteButton = document.createElement('button');
+        deleteButton.className = 'settings-btn danger';
+        deleteButton.type = 'button';
+        deleteButton.textContent = '删除';
+        deleteButton.addEventListener('click', () => {
+            armConfirm(deleteButton, '确认删除账户与数据', async () => {
+                const { status, data } = await api('/users/delete', { id: record.id });
+                if (status === 401) return refresh();
+                if (status !== 200) return toast(data.error || '删除失败', 'error');
+                toast('已删除账户「' + record.name + '」及其全部数据');
+                await reloadUsers();
+            });
+        });
+
+        actions.append(saveButton, resetButton, roleButton, toggleButton, deleteButton);
+    } else {
+        actions.append(resetButton);
+    }
+
+    row.append(head, meta, fields);
+    return row;
+}
+
+async function loadUsers() {
+    const { status, data } = await api('/users');
+    if (status === 401) {
+        state.loggedIn = false;
+        state.admin = false;
+        render();
+        return;
+    }
+    if (status === 403) {
+        state.admin = false;
+        render();
+        return;
+    }
+    if (status !== 200) {
+        toast((data && data.error) || '账户列表读取失败', 'error');
+        return;
+    }
+
+    state.users = Array.isArray(data.users) ? data.users : [];
+    state.accountCount = state.users.length;
+    // 选中的账户被删掉时落回自己
+    if (!accountById(state.account)) {
+        state.account = (state.user && state.user.id) || (state.users[0] ? state.users[0].id : '');
+    }
+
+    const list = $('user-list');
+    list.textContent = '';
+    state.users.forEach((record) => list.append(userRow(record)));
+    $('user-empty').hidden = state.users.length > 1;
+
+    fillAccountSelect();
+}
+
+async function reloadUsers() {
+    await loadUsers();
+    if (panelReady()) {
         await loadTokens();
         await loadJournal();
     }
@@ -251,6 +494,7 @@ function tokenRow(record) {
     deviceInput.addEventListener('input', syncSaveState);
     saveButton.addEventListener('click', async () => {
         const { status, data } = await api('/tokens/update', {
+            user: state.account,
             id: record.id,
             name: nameInput.value,
             device: deviceInput.value,
@@ -266,7 +510,9 @@ function tokenRow(record) {
     toggleButton.type = 'button';
     toggleButton.textContent = record.enabled ? '停用' : '启用';
     toggleButton.addEventListener('click', async () => {
-        const { status, data } = await api('/tokens/update', { id: record.id, enabled: !record.enabled });
+        const { status, data } = await api('/tokens/update', {
+            user: state.account, id: record.id, enabled: !record.enabled,
+        });
         if (status === 401) return refresh();
         if (status !== 200) return toast(data.error || '操作失败', 'error');
         toast(record.enabled ? '该令牌已停用，继续使用将收到 401' : '该令牌已重新启用');
@@ -279,7 +525,7 @@ function tokenRow(record) {
     rotateButton.textContent = '重置';
     rotateButton.addEventListener('click', () => {
         armConfirm(rotateButton, '确认重置？', async () => {
-            const { status, data } = await api('/tokens/rotate', { id: record.id });
+            const { status, data } = await api('/tokens/rotate', { user: state.account, id: record.id });
             if (status === 401) return refresh();
             if (status !== 200) return toast(data.error || '重置失败', 'error');
             $('reset-token').textContent = data.token || '';
@@ -295,7 +541,7 @@ function tokenRow(record) {
     deleteButton.textContent = '删除';
     deleteButton.addEventListener('click', () => {
         armConfirm(deleteButton, '确认删除', async () => {
-            const { status, data } = await api('/tokens/delete', { id: record.id });
+            const { status, data } = await api('/tokens/delete', { user: state.account, id: record.id });
             if (status === 401) return refresh();
             if (status !== 200) return toast(data.error || '删除失败', 'error');
             toast('令牌已删除');
@@ -330,10 +576,14 @@ function tokenRow(record) {
 }
 
 async function loadTokens() {
-    const { status, data } = await api('/tokens');
+    const { status, data } = await api('/tokens' + accountQuery());
     if (status === 401) {
         state.loggedIn = false;
         render();
+        return;
+    }
+    if (status !== 200) {
+        toast((data && data.error) || '令牌列表读取失败', 'error');
         return;
     }
 
@@ -365,7 +615,7 @@ async function loadJournal() {
     const summary = $('journal-summary');
     const button = $('journal-download');
     const compactButton = $('journal-compact');
-    const { status, data } = await api('/journal');
+    const { status, data } = await api('/journal' + accountQuery());
     if (status === 401) {
         state.loggedIn = false;
         render();
@@ -382,7 +632,7 @@ async function loadJournal() {
 
     const text = describeJournal(data);
     if (!text) {
-        summary.textContent = '还没有任何操作：客户端同步过一次之后，日志里才会有内容';
+        summary.textContent = '这个账户还没有任何操作：它同步过一次之后，日志里才会有内容';
         summary.title = '';
         button.disabled = true;
         if (compactButton) compactButton.disabled = true;
@@ -429,7 +679,7 @@ async function downloadJournal() {
     setMessage('journal-status', '正在从服务端读取日志…');
 
     try {
-        const response = await fetch(API_BASE + '/journal/download', { credentials: 'same-origin' });
+        const response = await fetch(API_BASE + '/journal/download' + accountQuery(), { credentials: 'same-origin' });
         if (!response.ok) {
             let data = {};
             try {
@@ -477,7 +727,7 @@ async function compactJournal() {
     setMessage('journal-status', '正在抹掉已彻底删除条目的正文与历史…');
 
     try {
-        const { status, data } = await api('/journal/compact', {});
+        const { status, data } = await api('/journal/compact', { user: state.account });
         if (status === 401) {
             state.loggedIn = false;
             render();
@@ -521,13 +771,19 @@ async function submitSetup() {
     $('setup-pass').value = '';
     $('setup-pass2').value = '';
     setMessage('setup-msg', '');
-    toast('管理密码已设置');
+    toast('admin 的密码已设置');
     await refresh();
 }
 
 async function submitLogin() {
+    const name = $('login-name').value.trim() || 'admin';
     setMessage('login-msg', '正在登录…');
-    const { status, data } = await api('/login', { password: $('login-pass').value });
+    const { status, data } = await api('/login', {
+        name,
+        password: $('login-pass').value,
+        // 本页只让管理员进：非管理员账户请从客户端登录
+        requireAdmin: true,
+    });
     if (status !== 200) return setMessage('login-msg', data.error || '登录失败', 'error');
 
     $('login-pass').value = '';
@@ -551,7 +807,11 @@ async function submitPasswordChange() {
 }
 
 async function createToken() {
-    const { status, data } = await api('/tokens', { name: $('new-name').value, device: $('new-device').value });
+    const { status, data } = await api('/tokens', {
+        user: state.account,
+        name: $('new-name').value,
+        device: $('new-device').value,
+    });
     if (status === 401) return refresh();
     if (status !== 200) return toast(data.error || '创建失败', 'error');
 
@@ -564,13 +824,50 @@ async function createToken() {
     showSecret('new-secret');
 }
 
+async function createUser() {
+    const name = $('user-name').value.trim();
+    const password = $('user-pass').value;
+    if (!name) return toast('请填写账户名', 'error');
+    if (password.length < 8) return toast('账户密码至少 8 位', 'error');
+
+    const { status, data } = await api('/users/create', {
+        name,
+        password,
+        admin: $('user-admin').checked,
+    });
+    if (status === 401) return refresh();
+    if (status !== 200) return toast(data.error || '新建失败', 'error');
+
+    $('user-name').value = '';
+    $('user-pass').value = '';
+    $('user-admin').checked = false;
+    toast('已新建账户「' + data.user.name + '」');
+    // 新建的账户直接选上：接着就能给它建令牌
+    state.account = data.user.id;
+    await reloadUsers();
+}
+
 function bindEvents() {
     $('setup-btn').addEventListener('click', submitSetup);
     $('login-btn').addEventListener('click', submitLogin);
+    $('user-create').addEventListener('click', () => {
+        createUser().catch((error) => {
+            console.error('新建账户失败:', error);
+            toast('新建账户失败，请检查网络后重试', 'error');
+        });
+    });
+    $('account-select').addEventListener('change', async (event) => {
+        state.account = event.currentTarget.value;
+        renderAccountMeta();
+        // 换了账户，令牌与日志两节跟着换
+        await loadTokens();
+        await loadJournal();
+    });
     $('new-btn').addEventListener('click', createToken);
     $('pass-btn').addEventListener('click', submitPasswordChange);
     $('logout-btn').addEventListener('click', async () => {
         await api('/logout', {});
+        state.account = '';
         await refresh();
         toast('已退出登录');
     });
@@ -597,7 +894,9 @@ function bindEvents() {
         });
     });
 
-    [['setup-pass', 'setup-pass2', submitSetup], ['login-pass', null, submitLogin], ['pass-new', 'pass-new2', submitPasswordChange]]
+    [['setup-pass', 'setup-pass2', submitSetup], ['login-pass', null, submitLogin],
+     ['login-name', null, submitLogin], ['pass-new', 'pass-new2', submitPasswordChange],
+     ['user-pass', null, createUser]]
         .forEach(([first, second, handler]) => {
             [first, second].filter(Boolean).forEach((id) => {
                 $(id).addEventListener('keydown', (event) => {

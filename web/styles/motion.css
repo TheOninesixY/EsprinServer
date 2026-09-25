@@ -108,6 +108,11 @@ html.appearance-fading *::after {
     #notes-list-box.list-enter > * {
         animation: none !important;
     }
+    /* 悬停滑出的「新建待办」：减少动效时直接出现在位，不做宽高补间 */
+    html.modern-layout .sidebar-action-wrap .sidebar-new-split .btn-sidebar-new-extra,
+    html.modern-layout .sidebar-action-wrap .sidebar-new-split .btn-sidebar-new-extra .ms-icon {
+        transition: none !important;
+    }
     html.appearance-fading,
     html.appearance-fading *,
     html.appearance-fading *::before,

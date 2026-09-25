@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import socket
 import sys
 import threading
@@ -23,18 +24,44 @@ CONFIG_NAME = "config.json"
 JOURNAL_NAME = "journal.log"
 JOURNAL_ID_NAME = "journal.id"
 
-ADMIN_FILE_NAME = "admin.json"
+USERS_FILE_NAME = "users.json"
+USERS_DIR_NAME = "users"
+# 每人的令牌放在自己的目录里，沿用旧版的文件名
 TOKENS_FILE_NAME = "tokens.json"
+# 内置账户：服务端始终保留它，不可删除、不可停用、不可取消管理员
+DEFAULT_ACCOUNT_ID = "admin"
+DEFAULT_ACCOUNT_NAME = "admin"
+ACCOUNT_NAME_MAX = 32
+# 旧版单账户布局：数据目录根下的 admin.json 与日志文件，首次启动时迁移进内置账户的目录
+LEGACY_ADMIN_FILE_NAME = "admin.json"
+# 账户 id 会当目录名用，Windows 上这几个名字不能作目录
+RESERVED_DIR_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + ["com{}".format(index) for index in range(1, 10)]
+    + ["lpt{}".format(index) for index in range(1, 10)]
+)
 ADMIN_COOKIE_NAME = "esprin_admin"
-# 同步接口挂在 /sync 下；管理页与其接口挂在根路径下
+# 三个入口各占一段前缀：网页版客户端在根路径，管理后台在 /admin，同步接口在 /sync
 SYNC_PATH = "/sync"
-API_PREFIX = "/api"
+ADMIN_PATH = "/admin"
+# 管理接口前缀：管理页挂在 /admin 下，接口随之挂在 /admin/api 下
+API_PREFIX = ADMIN_PATH + "/api"
 HEALTH_PATH = "/health"
-# 管理页在根路径：/ 返回页面，页面静态资源（样式、脚本、图标、字体）也从根路径取
+# 网页版客户端在根路径：/ 返回页面，静态资源按白名单从 web/ 目录取。
+# PWA 那几件（清单、Service Worker、图标）也都挂在根路径上，一并列进白名单
+WEB_ASSET_PATHS = (
+    "/favicon.png",
+    "/manifest.webmanifest",
+    "/sw.js",
+    "/icon-180.png",
+    "/icon-192.png",
+    "/icon-512.png",
+    "/icon-512-maskable.png",
+)
+WEB_ASSET_PREFIXES = ("/styles/", "/scripts/", "/fonts/")
+# 管理后台在 /admin：页面静态资源（样式、脚本、图标、字体）从 manager/ 目录按 /admin/ 下的路径取
 MANAGER_ASSET_PATHS = ("/app.css", "/app.js", "/favicon.png")
 MANAGER_ASSET_PREFIXES = ("/fonts/",)
-# 旧地址：管理页原先在 /admin，这里只留一次跳转，免得旧书签打不开
-LEGACY_ADMIN_PATH = "/admin"
 PBKDF2_ITERATIONS = 200_000
 PBKDF2_SALT_BYTES = 16
 SESSION_TTL_SECONDS = 12 * 60 * 60
@@ -112,15 +139,28 @@ def verify_password(password, stored):
         return False
 
 
-class AdminStore:
+class UserStore:
+    """账户、登录会话、访问令牌与各账户的数据日志。
+
+    数据布局：
+      <data>/users.json                     账户列表（姓名、密码摘要、角色、状态）与服务端密钥
+      <data>/users/<账户 id>/journal.log    该账户的全部数据
+      <data>/users/<账户 id>/journal.id     该账户的日志身份
+      <data>/users/<账户 id>/tokens.json    该账户的访问令牌摘要
+
+    每个账户一份独立的操作日志，账户之间互不可见。旧版把日志、令牌、密码摘要
+    直接放在数据目录根下，首次启动时会迁移成 id 为 admin 的账户（见 _migrate_legacy_files）。
+    """
+
     def __init__(self, data_dir):
         self.data_dir = data_dir
-        self.admin_path = os.path.join(data_dir, ADMIN_FILE_NAME)
-        self.tokens_path = os.path.join(data_dir, TOKENS_FILE_NAME)
+        self.users_path = os.path.join(data_dir, USERS_FILE_NAME)
         self.lock = threading.RLock()
-        self.password_hash = ""
         self.secret = ""
-        self.tokens = []
+        self.users = []
+        # 账户 id -> 令牌记录列表 / 操作日志对象
+        self.tokens = {}
+        self.journals = {}
         self.sessions = {}
         self.failures = {}
         self._load()
@@ -128,37 +168,160 @@ class AdminStore:
     def _load(self):
         os.makedirs(self.data_dir, exist_ok=True)
 
-        try:
-            with open(self.admin_path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            self.password_hash = str(data.get("password") or "")
-            self.secret = str(data.get("secret") or "")
-        except (OSError, ValueError):
-            pass
+        if not self._load_users_file():
+            self._bootstrap_users()
+
+        # 内置账户必须始终在：它被从 users.json 里删掉时补一个回来，避免把自己锁在门外
+        if not self.find_user(DEFAULT_ACCOUNT_ID):
+            self.users.append({
+                "id": DEFAULT_ACCOUNT_ID,
+                "name": DEFAULT_ACCOUNT_NAME,
+                "password": "",
+                "admin": True,
+                "enabled": True,
+                "createdAt": now_ms(),
+                "lastLoginAt": 0,
+            })
+            self._save_users()
+            log("WARN", "Users", "users.json 里缺少内置账户，已补回 (id={})".format(DEFAULT_ACCOUNT_ID))
 
         if not self.secret:
             self.secret = secrets.token_hex(32)
-            self._save_admin()
+            self._save_users()
 
+        self._migrate_legacy_files()
+        for user in self.users:
+            self._load_tokens(user["id"])
+
+    def _load_users_file(self):
         try:
-            with open(self.tokens_path, "r", encoding="utf-8") as handle:
+            with open(self.users_path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
-            tokens = data.get("tokens") if isinstance(data, dict) else None
-            if isinstance(tokens, list):
-                self.tokens = [item for item in tokens if isinstance(item, dict) and item.get("id")]
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict) or not isinstance(data.get("users"), list):
+            return False
+
+        loaded = []
+        for item in data["users"]:
+            if not isinstance(item, dict):
+                continue
+            user_id = str(item.get("id") or "").strip()
+            name = str(item.get("name") or "").strip()
+            if not user_id or not name:
+                continue
+            loaded.append({
+                "id": user_id,
+                "name": name,
+                "password": str(item.get("password") or ""),
+                "admin": bool(item.get("admin")),
+                "enabled": item.get("enabled", True) is not False,
+                "createdAt": int(item.get("createdAt") or 0),
+                "lastLoginAt": int(item.get("lastLoginAt") or 0),
+            })
+        if not loaded:
+            return False
+
+        self.secret = str(data.get("secret") or "")
+        self.users = loaded
+        # 内置账户恒为管理员且恒启用
+        builtin = self.find_user(DEFAULT_ACCOUNT_ID)
+        if builtin:
+            builtin["admin"] = True
+            builtin["enabled"] = True
+        return True
+
+    def _bootstrap_users(self):
+        """首次启动：建内置账户。旧版 admin.json 里的密码摘要与密钥在这里接过来。"""
+        password = ""
+        secret = ""
+        legacy_path = os.path.join(self.data_dir, LEGACY_ADMIN_FILE_NAME)
+        try:
+            with open(legacy_path, "r", encoding="utf-8") as handle:
+                legacy = json.load(handle)
+            if isinstance(legacy, dict):
+                password = str(legacy.get("password") or "")
+                secret = str(legacy.get("secret") or "")
         except (OSError, ValueError):
             pass
 
-    def _save_admin(self):
-        self._write_json(self.admin_path, {
-            "version": 1,
-            "password": self.password_hash,
-            "secret": self.secret,
-            "updatedAt": now_ms(),
-        })
+        self.secret = secret or self.secret or secrets.token_hex(32)
+        self.users = [{
+            "id": DEFAULT_ACCOUNT_ID,
+            "name": DEFAULT_ACCOUNT_NAME,
+            "password": password,
+            "admin": True,
+            "enabled": True,
+            "createdAt": now_ms(),
+            "lastLoginAt": 0,
+        }]
+        # 账户表丢了、但数据目录还在时，把那些账户补成占位（密码无从恢复，由管理员重设）：
+        # 否则那些目录里的数据既进不去、也看不见。
+        recovered = self._recover_account_dirs()
+        self._save_users()
+        log("INFO", "Users", "已初始化账户表: 内置账户={} 沿用旧密码={} 补回账户={}".format(
+            DEFAULT_ACCOUNT_NAME, bool(password), recovered))
 
-    def _save_tokens(self):
-        self._write_json(self.tokens_path, {"version": 1, "tokens": self.tokens})
+        # 旧文件已读过一次：改名归档，免得日后再读到里面那份过期的密码摘要
+        if password or secret:
+            try:
+                os.replace(legacy_path, legacy_path + ".migrated")
+                log("INFO", "Users", "旧版 admin.json 已归档为 {}(不再被读取)".format(
+                    LEGACY_ADMIN_FILE_NAME + ".migrated"))
+            except OSError as error:
+                log("WARN", "Users", "归档旧版 admin.json 失败: {} (path={})".format(error, legacy_path))
+
+    def _recover_account_dirs(self):
+        """列出 users/ 下已有的账户目录，补成没有密码的占位账户（管理员重设密码后即可登录）。"""
+        root = os.path.join(self.data_dir, USERS_DIR_NAME)
+        if not os.path.isdir(root):
+            return 0
+        count = 0
+        for name in sorted(os.listdir(root)):
+            if name == DEFAULT_ACCOUNT_ID or not os.path.isdir(os.path.join(root, name)):
+                continue
+            if self._validate_name(name):
+                continue
+            self.users.append({
+                "id": name,
+                "name": name,
+                "password": "",
+                "admin": False,
+                "enabled": True,
+                "createdAt": now_ms(),
+                "lastLoginAt": 0,
+            })
+            count += 1
+        if count:
+            log("WARN", "Users", "账户表缺失，已按数据目录补回 {} 个账户，密码需重新设置".format(count))
+        return count
+
+    def _migrate_legacy_files(self):
+        """旧版把日志与令牌放在数据目录根下：搬进内置账户的目录（原文件不再保留）。"""
+        target_dir = self.user_dir(DEFAULT_ACCOUNT_ID)
+        moved = []
+        for name in (JOURNAL_NAME, JOURNAL_ID_NAME, TOKENS_FILE_NAME):
+            source = os.path.join(self.data_dir, name)
+            if not os.path.isfile(source):
+                continue
+            target = os.path.join(target_dir, name)
+            if os.path.exists(target):
+                continue
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+                os.replace(source, target)
+                moved.append(name)
+            except OSError as error:
+                log("ERROR", "Users", "迁移旧版文件失败: {} (from={} to={})".format(error, source, target))
+        if moved:
+            log("INFO", "Users", "已迁移旧版单账户数据: dir={} files={}".format(target_dir, ",".join(moved)))
+
+    def _save_users(self):
+        self._write_json(self.users_path, {
+            "version": 1,
+            "secret": self.secret,
+            "users": self.users,
+        })
 
     def _write_json(self, path, value):
         try:
@@ -167,32 +330,256 @@ class AdminStore:
                 json.dump(value, handle, ensure_ascii=False, indent=2)
             os.replace(temp, path)
         except OSError as error:
-            log("ERROR", "Admin", "写入失败: {} (path={})".format(error, path))
+            log("ERROR", "Users", "写入失败: {} (path={})".format(error, path))
+
+    # ---------------- 账户 ----------------
+
+    def find_user(self, user_id):
+        wanted = str(user_id or "")
+        for user in self.users:
+            if user["id"] == wanted:
+                return user
+        return None
+
+    def find_user_by_name(self, name):
+        wanted = str(name or "").strip().casefold()
+        if not wanted:
+            return None
+        for user in self.users:
+            if user["name"].casefold() == wanted:
+                return user
+        return None
+
+    def builtin_user(self):
+        """内置账户（admin）：不可删除、不可停用、不可取消管理员。"""
+        return self.find_user(DEFAULT_ACCOUNT_ID)
 
     def password_set(self):
-        return bool(self.password_hash)
+        user = self.builtin_user()
+        return bool(user and user.get("password"))
 
     def set_password(self, password):
+        """给内置账户设首次密码；已设过则拒绝（此后走 change_password）。"""
         with self.lock:
-            if self.password_set():
+            user = self.builtin_user()
+            if not user or user.get("password"):
                 return False
-            self.password_hash = hash_password(password)
-            self._save_admin()
+            user["password"] = hash_password(password)
+            self._save_users()
             return True
 
-    def verify_password(self, password):
-        return verify_password(password, self.password_hash)
-
-    def change_password(self, old_password, new_password):
+    def change_password(self, user_id, old_password, new_password):
         with self.lock:
-            if not verify_password(old_password, self.password_hash):
+            user = self.find_user(user_id)
+            if not user or not verify_password(old_password, user.get("password") or ""):
                 return False
-            self.password_hash = hash_password(new_password)
-            self.sessions.clear()
-            self._save_admin()
+            user["password"] = hash_password(new_password)
+            # 换密码即断开该账户已登录的浏览器
+            self.destroy_user_sessions(user["id"])
+            self._save_users()
             return True
 
-    def create_session(self, ip):
+    def reset_password(self, user_id, password):
+        """管理员给其他账户重设密码：不需要原密码，重设后该账户的登录会话立即失效。"""
+        with self.lock:
+            user = self.find_user(user_id)
+            if not user:
+                return False, "找不到该账户"
+            if len(str(password or "")) < MIN_PASSWORD_LENGTH:
+                return False, "密码至少 {} 位".format(MIN_PASSWORD_LENGTH)
+            user["password"] = hash_password(password)
+            self.destroy_user_sessions(user["id"])
+            self._save_users()
+            return True, ""
+
+    def list_users(self):
+        with self.lock:
+            return [self.describe_user(user) for user in self._sorted_users()]
+
+    def describe_user(self, user):
+        summary = self.journal(user["id"]).summary()
+        return {
+            "id": user["id"],
+            "name": user["name"],
+            "admin": bool(user["admin"]),
+            "enabled": bool(user["enabled"]),
+            "builtIn": user["id"] == DEFAULT_ACCOUNT_ID,
+            "passwordSet": bool(user.get("password")),
+            "createdAt": int(user.get("createdAt") or 0),
+            "lastLoginAt": int(user.get("lastLoginAt") or 0),
+            "tokenCount": len(self.tokens.get(user["id"]) or []),
+            "journal": {
+                "ops": summary["ops"],
+                "files": summary["files"],
+                "deleted": summary["deleted"],
+                "recyclable": summary["recyclable"],
+                "size": summary["size"],
+                "exists": summary["exists"],
+            },
+        }
+
+    def _sorted_users(self):
+        # 内置账户排在最前，其余按创建时间
+        return sorted(self.users,
+                      key=lambda item: (item["id"] != DEFAULT_ACCOUNT_ID, item.get("createdAt") or 0))
+
+    def _validate_name(self, name, exclude_id=""):
+        text = str(name or "").strip()
+        if not text:
+            return "账户名不能为空"
+        if len(text) > ACCOUNT_NAME_MAX:
+            return "账户名最多 {} 个字符".format(ACCOUNT_NAME_MAX)
+        if any(part in text for part in ("/", "\\")) or any(ord(char) < 32 for char in text):
+            return "账户名不能包含斜杠或控制字符"
+        for user in self.users:
+            if user["id"] != exclude_id and user["name"].casefold() == text.casefold():
+                return "账户名已存在"
+        return ""
+
+    def _make_id(self, name):
+        """账户 id 会当目录名用：纯 ASCII 的名字直接当 id，其余用随机串。"""
+        taken = {user["id"].casefold() for user in self.users}
+        slug = re.sub(r"[^a-z0-9_-]+", "", str(name or "").lower())[:24].strip("-_")
+        if slug and slug not in taken and slug not in RESERVED_DIR_NAMES:
+            return slug
+        for _ in range(16):
+            candidate = "u_" + secrets.token_hex(6)
+            if candidate.casefold() not in taken:
+                return candidate
+        return "u_" + uuid.uuid4().hex
+
+    def create_user(self, name, password, is_admin=False):
+        with self.lock:
+            text = str(name or "").strip()
+            error = self._validate_name(text)
+            if error:
+                return None, error
+            if len(str(password or "")) < MIN_PASSWORD_LENGTH:
+                return None, "密码至少 {} 位".format(MIN_PASSWORD_LENGTH)
+            user = {
+                "id": self._make_id(text),
+                "name": text,
+                "password": hash_password(password),
+                "admin": bool(is_admin),
+                "enabled": True,
+                "createdAt": now_ms(),
+                "lastLoginAt": 0,
+            }
+            self.users.append(user)
+            self.tokens[user["id"]] = []
+            self._save_users()
+            log("INFO", "Users", "新建账户: name={} id={} admin={}".format(text, user["id"], user["admin"]))
+            return self.describe_user(user), ""
+
+    def update_user(self, user_id, name=None, enabled=None, is_admin=None):
+        with self.lock:
+            user = self.find_user(user_id)
+            if not user:
+                return None, "找不到该账户"
+            builtin = user["id"] == DEFAULT_ACCOUNT_ID
+            if name is not None and str(name).strip() != user["name"]:
+                if builtin:
+                    return None, "内置账户 {} 不能改名".format(DEFAULT_ACCOUNT_NAME)
+                error = self._validate_name(name, user["id"])
+                if error:
+                    return None, error
+                user["name"] = str(name).strip()
+            if enabled is not None:
+                if builtin and not enabled:
+                    return None, "内置账户 {} 不能停用".format(DEFAULT_ACCOUNT_NAME)
+                user["enabled"] = bool(enabled)
+                if not user["enabled"]:
+                    self.destroy_user_sessions(user["id"])
+            if is_admin is not None:
+                if builtin and not is_admin:
+                    return None, "内置账户 {} 不能取消管理员".format(DEFAULT_ACCOUNT_NAME)
+                user["admin"] = bool(is_admin)
+            self._save_users()
+            log("INFO", "Users", "更新账户: name={} id={} enabled={} admin={}".format(
+                user["name"], user["id"], user["enabled"], user["admin"]))
+            return self.describe_user(user), ""
+
+    def delete_user(self, user_id):
+        with self.lock:
+            user = self.find_user(user_id)
+            if not user:
+                return False, "找不到该账户"
+            if user["id"] == DEFAULT_ACCOUNT_ID:
+                return False, "内置账户 {} 不能删除".format(DEFAULT_ACCOUNT_NAME)
+            self.users = [item for item in self.users if item["id"] != user["id"]]
+            self.tokens.pop(user["id"], None)
+            self.journals.pop(user["id"], None)
+            self.destroy_user_sessions(user["id"])
+            self._save_users()
+            name, removed_id = user["name"], user["id"]
+
+        # 账户目录连同数据一起删掉
+        target = self.user_dir(removed_id)
+        data_removed = False
+        if os.path.isdir(target):
+            try:
+                shutil.rmtree(target)
+                data_removed = True
+            except OSError as error:
+                log("ERROR", "Users", "删除账户目录失败: {} (path={})".format(error, target))
+        log("INFO", "Users", "已删除账户: name={} id={} dataRemoved={}".format(name, removed_id, data_removed))
+        return True, ""
+
+    def authenticate(self, name, password):
+        """按账户名 + 密码校验。账户不存在与密码错误返回同一句提示，不透露账户是否存在。"""
+        with self.lock:
+            text = str(name or "").strip()
+            user = self.find_user_by_name(text) if text else self.builtin_user()
+            if not user or not verify_password(password, user.get("password") or ""):
+                return None, "账户名或密码不正确"
+            if not user["enabled"]:
+                return None, "该账户已停用"
+            user["lastLoginAt"] = now_ms()
+            self._save_users()
+            return user, ""
+
+    # ---------------- 访问令牌 ----------------
+
+    def _token_records(self, user_id):
+        return self.tokens.setdefault(str(user_id), [])
+
+    def _tokens_path(self, user_id):
+        return os.path.join(self.user_dir(user_id), TOKENS_FILE_NAME)
+
+    def _load_tokens(self, user_id):
+        try:
+            with open(self._tokens_path(user_id), "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            records = data.get("tokens") if isinstance(data, dict) else None
+            if isinstance(records, list):
+                self.tokens[user_id] = [item for item in records if isinstance(item, dict) and item.get("id")]
+        except (OSError, ValueError):
+            pass
+
+    def _save_tokens(self, user_id):
+        os.makedirs(self.user_dir(user_id), exist_ok=True)
+        self._write_json(self._tokens_path(user_id), {"version": 1, "tokens": self._token_records(user_id)})
+
+    def token_count(self):
+        with self.lock:
+            return sum(len(records) for records in self.tokens.values())
+
+    def user_dir(self, user_id):
+        return os.path.join(self.data_dir, USERS_DIR_NAME, str(user_id))
+
+    def journal(self, user_id):
+        """取某账户的操作日志（首次访问时读盘建索引）。"""
+        with self.lock:
+            user_id = str(user_id)
+            found = self.journals.get(user_id)
+            if found is None:
+                found = Journal(self.user_dir(user_id))
+                self.journals[user_id] = found
+            return found
+
+    # ---------------- 登录会话 ----------------
+
+    def create_session(self, user_id, ip):
         with self.lock:
             now = now_ms()
             self.sessions = {
@@ -200,24 +587,45 @@ class AdminStore:
                 if now - value["lastSeenAt"] < SESSION_TTL_SECONDS * 1000
             }
             session_id = secrets.token_urlsafe(32)
-            self.sessions[session_id] = {"createdAt": now, "lastSeenAt": now, "ip": ip}
+            self.sessions[session_id] = {
+                "userId": str(user_id), "createdAt": now, "lastSeenAt": now, "ip": ip,
+            }
             return session_id
 
     def touch_session(self, session_id):
+        """会话有效时返回它，过期或不存在返回 None。"""
         with self.lock:
             session = self.sessions.get(session_id)
             if not session:
-                return False
+                return None
             now = now_ms()
             if now - session["lastSeenAt"] > SESSION_TTL_SECONDS * 1000:
                 self.sessions.pop(session_id, None)
-                return False
+                return None
             session["lastSeenAt"] = now
-            return True
+            return session
+
+    def session_user(self, session_id):
+        """会话对应的账户；账户已被删除或停用时连会话一起作废。"""
+        session = self.touch_session(session_id)
+        if not session:
+            return None, None
+        user = self.find_user(session.get("userId"))
+        if not user or not user["enabled"]:
+            self.destroy_session(session_id)
+            return None, None
+        return user, session
 
     def destroy_session(self, session_id):
         with self.lock:
             self.sessions.pop(session_id, None)
+
+    def destroy_user_sessions(self, user_id):
+        with self.lock:
+            self.sessions = {
+                key: value for key, value in self.sessions.items()
+                if value.get("userId") != str(user_id)
+            }
 
     def login_allowed(self, ip):
         with self.lock:
@@ -233,17 +641,18 @@ class AdminStore:
     def _digest(self, token):
         return hmac.new(self.secret.encode("utf-8"), token.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    def _find_by_id(self, token_id):
-        for item in self.tokens:
+    def _find_by_id(self, user_id, token_id):
+        for item in self._token_records(user_id):
             if item.get("id") == token_id:
                 return item
         return None
 
-    def list_tokens(self):
+    def list_tokens(self, user_id):
         with self.lock:
-            return [{key: value for key, value in item.items() if key != "digest"} for item in self.tokens]
+            return [{key: value for key, value in item.items() if key != "digest"}
+                    for item in self._token_records(user_id)]
 
-    def create_token(self, name, device):
+    def create_token(self, user_id, name, device):
         with self.lock:
             token = "esn_" + secrets.token_urlsafe(24)
             record = {
@@ -256,24 +665,24 @@ class AdminStore:
                 "lastDeviceId": "",
                 "enabled": True,
             }
-            self.tokens.append(record)
-            self._save_tokens()
+            self._token_records(user_id).append(record)
+            self._save_tokens(user_id)
             return record["id"], token
 
-    def rotate_token(self, token_id):
+    def rotate_token(self, user_id, token_id):
         with self.lock:
-            record = self._find_by_id(token_id)
+            record = self._find_by_id(user_id, token_id)
             if not record:
                 return None
             token = "esn_" + secrets.token_urlsafe(24)
             record["digest"] = self._digest(token)
             record["lastUsedAt"] = 0
-            self._save_tokens()
+            self._save_tokens(user_id)
             return token
 
-    def update_token(self, token_id, name=None, device=None, enabled=None):
+    def update_token(self, user_id, token_id, name=None, device=None, enabled=None):
         with self.lock:
-            record = self._find_by_id(token_id)
+            record = self._find_by_id(user_id, token_id)
             if not record:
                 return None
             if name is not None:
@@ -282,29 +691,32 @@ class AdminStore:
                 record["device"] = str(device).strip()
             if enabled is not None:
                 record["enabled"] = bool(enabled)
-            self._save_tokens()
+            self._save_tokens(user_id)
             return {key: value for key, value in record.items() if key != "digest"}
 
-    def delete_token(self, token_id):
+    def delete_token(self, user_id, token_id):
         with self.lock:
-            before = len(self.tokens)
-            self.tokens = [item for item in self.tokens if item.get("id") != token_id]
-            if len(self.tokens) == before:
+            records = self._token_records(user_id)
+            before = len(records)
+            self.tokens[user_id] = [item for item in records if item.get("id") != token_id]
+            if len(self.tokens[user_id]) == before:
                 return False
-            self._save_tokens()
+            self._save_tokens(user_id)
             return True
 
     def find_token_by_plain(self, token):
+        """按明文找令牌：返回 (账户 id, 记录)；令牌可以属于任何一个账户。"""
         if not token:
-            return None
+            return None, None
         digest = self._digest(token)
         with self.lock:
-            for item in self.tokens:
-                if hmac.compare_digest(str(item.get("digest") or ""), digest):
-                    return item
-        return None
+            for user_id, records in self.tokens.items():
+                for item in records:
+                    if hmac.compare_digest(str(item.get("digest") or ""), digest):
+                        return user_id, item
+        return None, None
 
-    def note_token_use(self, record, device_id):
+    def note_token_use(self, user_id, record, device_id):
         with self.lock:
             now = now_ms()
             changed = False
@@ -315,7 +727,7 @@ class AdminStore:
                 record["lastUsedAt"] = now
                 changed = True
             if changed:
-                self._save_tokens()
+                self._save_tokens(user_id)
 
 
 class Journal:
@@ -691,12 +1103,14 @@ class Journal:
 
 
 MANAGER_DIR_NAME = "manager"
-MANAGER_INDEX_NAME = "index.html"
+WEB_DIR_NAME = "web"
+INDEX_NAME = "index.html"
 ASSET_CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
     ".css": "text/css; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
     ".json": "application/json; charset=utf-8",
+    ".webmanifest": "application/manifest+json",
     ".svg": "image/svg+xml",
     ".png": "image/png",
     ".ico": "image/x-icon",
@@ -707,12 +1121,11 @@ ASSET_CONTENT_TYPES = {
 }
 
 MISSING_PAGE_HTML = """<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="UTF-8"><title>找不到管理页面</title></head>
+<html lang="zh-CN"><head><meta charset="UTF-8"><title>缺少页面文件</title></head>
 <body style="font:14px/1.7 -apple-system,'Segoe UI','Microsoft YaHei',sans-serif;padding:40px;background:#0d1117;color:#f0f6fc">
-<h1 style="font-size:18px;margin-bottom:12px">找不到管理页面</h1>
-<p style="color:#8b949e">服务端期望在下面这个位置读到 index.html：</p>
+<h1 style="font-size:18px;margin-bottom:12px">找不到{title}的页面文件</h1>
+<p style="color:#8b949e">服务端读取入口页面的位置：</p>
 <p><code style="background:#21262d;padding:6px 10px;border-radius:6px;display:inline-block">{path}</code></p>
-<p style="color:#8b949e">把仓库里的 manager/ 目录（index.html、app.css、app.js、fonts/）放到服务端脚本旁边，再刷新本页。</p>
 </body></html>
 """
 
@@ -721,21 +1134,32 @@ def manager_dir():
     return os.path.join(SCRIPT_DIR, MANAGER_DIR_NAME)
 
 
-def read_manager_index():
-    path = os.path.join(manager_dir(), MANAGER_INDEX_NAME)
+def web_dir():
+    return os.path.join(SCRIPT_DIR, WEB_DIR_NAME)
+
+
+def read_index_html(root, title):
+    path = os.path.join(root, INDEX_NAME)
     try:
         with open(path, "r", encoding="utf-8") as handle:
             return handle.read()
     except OSError:
-        return MISSING_PAGE_HTML.replace("{path}", path)
+        return MISSING_PAGE_HTML.replace("{title}", title).replace("{path}", path)
+
+
+def read_manager_index():
+    return read_index_html(manager_dir(), "管理后台")
+
+
+def read_web_index():
+    return read_index_html(web_dir(), "网页版客户端")
 
 
 class ApiHandler(BaseHTTPRequestHandler):
     server_version = f"{SERVER_NAME}/{SERVER_VERSION}"
     protocol_version = "HTTP/1.1"
 
-    journal = None
-    admin = None
+    users = None
     token = ""
 
     def log_message(self, fmt, *args):
@@ -764,9 +1188,16 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _session_id(self):
         return self._cookie_value(ADMIN_COOKIE_NAME)
 
-    def _has_session(self):
+    def _current_user(self):
+        """当前登录会话对应的账户；未登录、会话过期、账户已停用都返回 None。"""
         session_id = self._session_id()
-        return bool(session_id) and self.admin.touch_session(session_id)
+        if not session_id:
+            return None
+        user, _session = self.users.session_user(session_id)
+        return user
+
+    def _journal_for(self, user_id):
+        return self.users.journal(user_id)
 
     def _session_cookie(self, session_id):
         return "{}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}".format(
@@ -810,12 +1241,15 @@ class ApiHandler(BaseHTTPRequestHandler):
                    extra_headers={"Cache-Control": "no-store"})
 
     def _send_manager_asset(self, path):
-        self._send_static_asset(manager_dir(), path, MANAGER_INDEX_NAME)
+        self._send_static_asset(manager_dir(), path, INDEX_NAME)
 
-    def _send_journal_attachment(self):
-        target = self.journal.path
+    def _send_web_asset(self, path):
+        self._send_static_asset(web_dir(), path, INDEX_NAME)
+
+    def _send_journal_attachment(self, journal):
+        target = journal.path
         if not os.path.isfile(target):
-            self._send(404, {"ok": False, "error": "日志文件还不存在：服务端还没有收到任何同步操作"})
+            self._send(404, {"ok": False, "error": "日志文件还不存在：该账户还没有同步过任何内容"})
             return
 
         try:
@@ -849,21 +1283,30 @@ class ApiHandler(BaseHTTPRequestHandler):
             value = header[7:].strip()
 
             if self.token and hmac.compare_digest(value, self.token):
-                return {"id": "", "name": "启动参数 --token", "device": "", "builtin": True}, ""
+                return {"id": "", "name": "启动参数 --token", "device": "", "builtin": True,
+                        "userId": DEFAULT_ACCOUNT_ID}, ""
 
-            record = self.admin.find_token_by_plain(value)
+            user_id, record = self.users.find_token_by_plain(value)
             if not record:
                 return None, "令牌无效（请在管理后台确认，或看看是不是刚重置过）"
             if not record.get("enabled", True):
                 return None, "该令牌已在管理后台停用"
-            return record, ""
+            user = self.users.find_user(user_id)
+            if not user or not user["enabled"]:
+                return None, "该令牌所属的账户已停用"
+            # record 是存储里的那份记录本身：记「最近使用」时要就地改它
+            return {"id": record["id"], "name": record.get("name", ""), "device": record.get("device", ""),
+                    "builtin": False, "userId": user_id, "userName": user["name"], "record": record}, ""
 
-        # 同源请求：认管理后台的登录会话（就在本服务端登录，同源页面可直接读写同步接口）。
-        # 未配置任何凭据时不再放行：读写一律要求管理密码会话或访问令牌
-        if self._is_same_origin() and self._has_session():
-            return {"id": "", "name": "管理后台会话", "device": "", "builtin": False}, ""
+        # 同源请求：认登录会话（就在本服务端登录，同源页面可直接读写同步接口）。
+        # 未配置任何凭据时不再放行：读写一律要求登录会话或访问令牌
+        if self._is_same_origin():
+            user = self._current_user()
+            if user:
+                return {"id": "", "name": "登录会话 {}".format(user["name"]), "device": "",
+                        "builtin": False, "userId": user["id"], "userName": user["name"]}, ""
 
-        return None, "缺少凭据（请先登录管理后台，客户端请在设置里填写访问令牌）"
+        return None, "缺少凭据（请先登录，客户端请在设置里填写访问令牌）"
 
     def _read_json(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -879,16 +1322,27 @@ class ApiHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
 
         if parsed.path == SYNC_PATH + "/health":
-            self._send(200, {
+            # 不带凭据时只报服务端身份（同步相关的两项留空）：健康检查不该泄露任何一个账户的规模。
+            # 带凭据时补上该凭据所属账户的日志身份，客户端靠它发现日志被换过。
+            payload = {
                 "ok": True,
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION,
-                "journalId": self.journal.journal_id,
-                "latestSeq": self.journal.latest_seq,
+                "journalId": "",
+                "latestSeq": 0,
+                "account": "",
                 "authRequired": True,
                 "syncPath": SYNC_PATH,
-                "adminPath": "/",
-            })
+                "webPath": "/",
+                "adminPath": ADMIN_PATH,
+            }
+            record, _error = self._authorize_api()
+            if record:
+                journal = self._journal_for(record["userId"])
+                payload["journalId"] = journal.journal_id
+                payload["latestSeq"] = journal.latest_seq
+                payload["account"] = record.get("userName") or DEFAULT_ACCOUNT_NAME
+            self._send(200, payload)
             return
 
         if parsed.path == HEALTH_PATH:
@@ -897,32 +1351,45 @@ class ApiHandler(BaseHTTPRequestHandler):
                 "name": SERVER_NAME,
                 "version": SERVER_VERSION,
                 "syncPath": SYNC_PATH,
-                "adminPath": "/",
+                "webPath": "/",
+                "adminPath": ADMIN_PATH,
                 "apiPath": API_PREFIX,
-                "passwordSet": self.admin.password_set(),
-                "tokenCount": len(self.admin.list_tokens()),
+                "passwordSet": self.users.password_set(),
+                "tokenCount": self.users.token_count(),
+                "accountCount": len(self.users.users),
+                "defaultAccount": DEFAULT_ACCOUNT_NAME,
                 "authRequired": True,
             })
             return
 
-        # 管理页：根路径返回页面，页面资源（样式、脚本、图标、字体）也从 manager/ 目录按根路径取
+        # 网页版客户端：根路径返回页面，页面资源（样式、脚本、图标、字体）按白名单从 web/ 目录取
         if parsed.path in ("/", "/index.html"):
-            page = read_manager_index()
+            page = read_web_index()
             self._send(200, raw=page.encode("utf-8"), content_type="text/html; charset=utf-8",
                        extra_headers={"Cache-Control": "no-store"})
             return
 
-        if parsed.path in MANAGER_ASSET_PATHS or parsed.path.startswith(MANAGER_ASSET_PREFIXES):
-            self._send_manager_asset(parsed.path)
+        if parsed.path in WEB_ASSET_PATHS or parsed.path.startswith(WEB_ASSET_PREFIXES):
+            self._send_web_asset(parsed.path)
             return
 
-        # 管理页原先挂在 /admin：页面与接口都已挪到根路径，这里只做一次跳转
-        if parsed.path in (LEGACY_ADMIN_PATH, LEGACY_ADMIN_PATH + "/"):
-            self._send(302, raw=b"", extra_headers={"Location": "/"})
-            return
-
+        # 管理接口：/admin/api/*
         if parsed.path.startswith(API_PREFIX + "/"):
-            self._handle_admin_get(parsed.path)
+            self._handle_admin_get(parsed.path, query)
+            return
+
+        # 管理页：/admin 返回页面，页面资源（样式、脚本、图标、字体）也从它下面取
+        if parsed.path == ADMIN_PATH or parsed.path.startswith(ADMIN_PATH + "/"):
+            rest = parsed.path[len(ADMIN_PATH):]
+            if rest in ("", "/", "/" + INDEX_NAME):
+                page = read_manager_index()
+                self._send(200, raw=page.encode("utf-8"), content_type="text/html; charset=utf-8",
+                           extra_headers={"Cache-Control": "no-store"})
+                return
+            if rest in MANAGER_ASSET_PATHS or rest.startswith(MANAGER_ASSET_PREFIXES):
+                self._send_manager_asset(rest)
+                return
+            self._send(404, {"ok": False, "error": "找不到文件"})
             return
 
         record, error = self._authorize_api()
@@ -930,30 +1397,33 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send(401, {"ok": False, "error": error})
             return
 
+        # 下面这一段是同步接口：一律作用在当前凭据所属账户的那份日志上
+        journal = self._journal_for(record["userId"])
+
         if parsed.path == SYNC_PATH + "/ops":
             since = int((query.get("since") or ["0"])[0] or 0)
             limit = int((query.get("limit") or [str(DEFAULT_PAGE_LIMIT)])[0] or DEFAULT_PAGE_LIMIT)
             limit = max(1, min(limit, MAX_PAGE_LIMIT))
-            ops = self.journal.read_ops(since, limit)
+            ops = journal.read_ops(since, limit)
             self._send(200, {
                 "ok": True,
-                "latestSeq": self.journal.latest_seq,
+                "latestSeq": journal.latest_seq,
                 "ops": ops,
-                "hasMore": bool(ops) and ops[-1]["seq"] < self.journal.latest_seq,
+                "hasMore": bool(ops) and ops[-1]["seq"] < journal.latest_seq,
             })
             return
 
         # 可复用 ID：被删除的条目腾出来的 ID（最近删掉的排在前面），供新建的条目领取
         if parsed.path == SYNC_PATH + "/ids":
             limit = parse_int((query.get("limit") or [""])[0], RECYCLE_POOL_LIMIT, 1, RECYCLE_POOL_LIMIT)
-            pool = self.journal.recyclable(limit)
+            pool = journal.recyclable(limit)
             self._send(200, {"ok": True, "count": len(pool), "ids": pool})
             return
 
         if parsed.path == SYNC_PATH + "/state":
-            state = self.journal.state()
+            state = journal.state()
             state["ok"] = True
-            state["journalId"] = self.journal.journal_id
+            state["journalId"] = journal.journal_id
             self._send(200, state)
             return
 
@@ -962,7 +1432,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not path:
                 self._send(400, {"ok": False, "error": "路径不合法"})
                 return
-            entry = self.journal.read_file(path)
+            entry = journal.read_file(path)
             if not entry:
                 self._send(404, {"ok": False, "error": "没有该文件（可能已被删除）"})
                 return
@@ -990,13 +1460,16 @@ class ApiHandler(BaseHTTPRequestHandler):
             self._send(401, {"ok": False, "error": error})
             return
 
+        # 同步接口一律作用在当前凭据所属账户的那份日志上
+        journal = self._journal_for(record["userId"])
+
         if parsed.path == SYNC_PATH + "/ops":
             payload = self._read_json()
             if not payload or not isinstance(payload.get("ops"), list):
                 self._send(400, {"ok": False, "error": "请求体需要 {device, ops:[...]}"})
                 return
             if not payload["ops"]:
-                self._send(200, {"ok": True, "latestSeq": self.journal.latest_seq, "accepted": []})
+                self._send(200, {"ok": True, "latestSeq": journal.latest_seq, "accepted": []})
                 return
 
             bound_device = str(record.get("device") or "")
@@ -1005,24 +1478,24 @@ class ApiHandler(BaseHTTPRequestHandler):
                 for raw in payload["ops"]:
                     if isinstance(raw, dict):
                         raw.pop("device", None)
-            accepted = self.journal.append_many(device, payload["ops"])
-            if record.get("id"):
-                self.admin.note_token_use(record, str(payload.get("device") or ""))
+            accepted = journal.append_many(device, payload["ops"])
+            if record.get("record"):
+                self.users.note_token_use(record["userId"], record["record"], str(payload.get("device") or ""))
 
             # 彻底删除（del）之后，这条路径的正文历史不必再留在日志里：只留那一条删除标记
             deleted_paths = [raw.get("path") for raw in payload["ops"]
                              if isinstance(raw, dict) and raw.get("op") == "del"]
             if deleted_paths:
-                compacted = self.journal.compact(deleted_paths)
+                compacted = journal.compact(deleted_paths)
                 if compacted["removed"]:
-                    log("INFO", "Journal", "彻底删除后整理日志: 抹掉 {} 行，保留 {} 行".format(
-                        compacted["removed"], compacted["kept"]))
+                    log("INFO", "Journal", "彻底删除后整理日志: 抹掉 {} 行，保留 {} 行 (account={})".format(
+                        compacted["removed"], compacted["kept"], record["userId"]))
 
             rejected = [item for item in accepted if item.get("error")]
             self._send(200, {
                 "ok": not rejected,
                 "error": rejected[0]["error"] if rejected else "",
-                "latestSeq": self.journal.latest_seq,
+                "latestSeq": journal.latest_seq,
                 "accepted": accepted,
             })
             return
@@ -1042,39 +1515,86 @@ class ApiHandler(BaseHTTPRequestHandler):
             if since is not None:
                 since = parse_int(since, 0, 0, 2 ** 62)
             device = str(payload.get("device") or record.get("device") or "")
-            picked, pending = self.journal.claim_recyclable(device, kind, count, since)
+            picked, pending = journal.claim_recyclable(device, kind, count, since)
             self._send(200, {"ok": True, "count": len(picked), "pending": pending, "ids": picked})
             return
 
         self._send(404, {"ok": False, "error": "未知接口"})
 
-    def _handle_admin_get(self, path):
+    # ---------------- 管理接口 ----------------
+    # 除 status / login / logout / 改自己的密码之外，一律要求管理员账户
+
+    def _admin_guard(self):
+        """已登录且是管理员时返回账户，否则自行作答并返回 None。"""
+        user = self._current_user()
+        if not user:
+            self._send(401, {"ok": False, "error": "请先登录管理后台"})
+            return None
+        if not user["admin"]:
+            self._send(403, {"ok": False, "error": "该账户没有管理权限"})
+            return None
+        return user
+
+    def _resolve_account(self, raw, fallback):
+        """管理接口里指定的账户：空值表示调用者自己；返回 (账户 id, 错误)。"""
+        text = str(raw or "").strip()
+        if not text:
+            return fallback, ""
+        user = self.users.find_user(text) or self.users.find_user_by_name(text)
+        if not user:
+            return None, "找不到该账户"
+        return user["id"], ""
+
+    def _handle_admin_get(self, path, query):
         if path == API_PREFIX + "/status":
+            user = self._current_user()
             self._send(200, {
                 "ok": True,
                 "version": SERVER_VERSION,
-                "passwordSet": self.admin.password_set(),
-                "loggedIn": self._has_session(),
-                "tokenCount": len(self.admin.list_tokens()),
+                "passwordSet": self.users.password_set(),
+                "loggedIn": bool(user),
+                "admin": bool(user and user["admin"]),
+                "user": {"id": user["id"], "name": user["name"], "admin": bool(user["admin"])} if user else None,
+                "accountCount": len(self.users.users),
+                "tokenCount": self.users.token_count(),
             })
             return
 
-        if not self._has_session():
-            self._send(401, {"ok": False, "error": "请先登录管理后台"})
+        current = self._admin_guard()
+        if not current:
+            return
+
+        account = (query.get("user") or [""])[0]
+
+        if path == API_PREFIX + "/users":
+            self._send(200, {"ok": True, "users": self.users.list_users()})
             return
 
         if path == API_PREFIX + "/tokens":
-            self._send(200, {"ok": True, "tokens": self.admin.list_tokens()})
+            user_id, error = self._resolve_account(account, current["id"])
+            if not user_id:
+                self._send(404, {"ok": False, "error": error})
+                return
+            self._send(200, {"ok": True, "user": user_id, "tokens": self.users.list_tokens(user_id)})
             return
 
         if path == API_PREFIX + "/journal":
-            payload = self.journal.summary()
+            user_id, error = self._resolve_account(account, current["id"])
+            if not user_id:
+                self._send(404, {"ok": False, "error": error})
+                return
+            payload = self.users.journal(user_id).summary()
             payload["ok"] = True
+            payload["user"] = user_id
             self._send(200, payload)
             return
 
         if path == API_PREFIX + "/journal/download":
-            self._send_journal_attachment()
+            user_id, error = self._resolve_account(account, current["id"])
+            if not user_id:
+                self._send(404, {"ok": False, "error": error})
+                return
+            self._send_journal_attachment(self.users.journal(user_id))
             return
 
         self._send(404, {"ok": False, "error": "未知接口"})
@@ -1085,86 +1605,147 @@ class ApiHandler(BaseHTTPRequestHandler):
             if len(password) < MIN_PASSWORD_LENGTH:
                 self._send(400, {"ok": False, "error": "密码至少 {} 位".format(MIN_PASSWORD_LENGTH)})
                 return
-            if not self.admin.set_password(password):
+            if not self.users.set_password(password):
                 self._send(400, {"ok": False, "error": "管理密码已经设置过了，请用现有密码登录"})
                 return
-            session_id = self.admin.create_session(self._client_ip())
+            session_id = self.users.create_session(DEFAULT_ACCOUNT_ID, self._client_ip())
+            log("INFO", "Auth", "内置账户已设密码: name={}".format(DEFAULT_ACCOUNT_NAME))
             self._send(200, {"ok": True}, extra_headers={"Set-Cookie": self._session_cookie(session_id)})
             return
 
         if path == API_PREFIX + "/login":
             ip = self._client_ip()
-            if not self.admin.login_allowed(ip):
+            if not self.users.login_allowed(ip):
                 self._send(429, {"ok": False, "error": "尝试次数过多，请稍后再试"})
                 return
-            if not self.admin.verify_password(str(payload.get("password") or "")):
-                self.admin.note_login_failure(ip)
-                self._send(401, {"ok": False, "error": "密码不正确"})
+            user, error = self.users.authenticate(
+                str(payload.get("name") or ""), str(payload.get("password") or ""))
+            if not user:
+                self.users.note_login_failure(ip)
+                self._send(401, {"ok": False, "error": error})
                 return
-            session_id = self.admin.create_session(ip)
-            self._send(200, {"ok": True}, extra_headers={"Set-Cookie": self._session_cookie(session_id)})
+            # 管理后台只允许管理员登录；网页版客户端走同一个接口，用 requireAdmin 区分
+            if payload.get("requireAdmin") and not user["admin"]:
+                self._send(403, {"ok": False, "error": "该账户不是管理员，无法进入管理后台"})
+                return
+            session_id = self.users.create_session(user["id"], ip)
+            log("INFO", "Auth", "登录成功: name={} admin={} ip={}".format(user["name"], user["admin"], ip))
+            self._send(200, {
+                "ok": True,
+                "user": {"id": user["id"], "name": user["name"], "admin": bool(user["admin"])},
+            }, extra_headers={"Set-Cookie": self._session_cookie(session_id)})
             return
 
-        if not self._has_session():
-            self._send(401, {"ok": False, "error": "请先登录管理后台"})
+        current = self._current_user()
+        if not current:
+            self._send(401, {"ok": False, "error": "请先登录"})
             return
 
         if path == API_PREFIX + "/logout":
-            self.admin.destroy_session(self._session_id())
+            self.users.destroy_session(self._session_id())
             self._send(200, {"ok": True}, extra_headers={"Set-Cookie": self._expired_cookie()})
             return
 
+        # 改自己的密码：任何已登录账户都能改
         if path == API_PREFIX + "/password":
             new_password = str(payload.get("newPassword") or "")
             if len(new_password) < MIN_PASSWORD_LENGTH:
                 self._send(400, {"ok": False, "error": "新密码至少 {} 位".format(MIN_PASSWORD_LENGTH)})
                 return
-            if not self.admin.change_password(str(payload.get("oldPassword") or ""), new_password):
+            if not self.users.change_password(current["id"], str(payload.get("oldPassword") or ""), new_password):
                 self._send(400, {"ok": False, "error": "当前密码不正确"})
                 return
-            session_id = self.admin.create_session(self._client_ip())
+            session_id = self.users.create_session(current["id"], self._client_ip())
             self._send(200, {"ok": True}, extra_headers={"Set-Cookie": self._session_cookie(session_id)})
             return
 
+        # 以下都只有管理员能做
+        if not current["admin"]:
+            self._send(403, {"ok": False, "error": "该账户没有管理权限"})
+            return
+
+        if path == API_PREFIX + "/users/create":
+            record, error = self.users.create_user(
+                payload.get("name"), payload.get("password"), bool(payload.get("admin")))
+            if not record:
+                self._send(400, {"ok": False, "error": error})
+                return
+            self._send(200, {"ok": True, "user": record, "users": self.users.list_users()})
+            return
+
+        if path == API_PREFIX + "/users/update":
+            record, error = self.users.update_user(
+                str(payload.get("id") or ""), payload.get("name"), payload.get("enabled"), payload.get("admin"))
+            if not record:
+                self._send(400, {"ok": False, "error": error})
+                return
+            self._send(200, {"ok": True, "user": record, "users": self.users.list_users()})
+            return
+
+        if path == API_PREFIX + "/users/password":
+            reset, error = self.users.reset_password(str(payload.get("id") or ""), payload.get("password"))
+            if not reset:
+                self._send(400, {"ok": False, "error": error})
+                return
+            self._send(200, {"ok": True, "users": self.users.list_users()})
+            return
+
+        if path == API_PREFIX + "/users/delete":
+            removed, error = self.users.delete_user(str(payload.get("id") or ""))
+            if not removed:
+                self._send(400, {"ok": False, "error": error})
+                return
+            self._send(200, {"ok": True, "users": self.users.list_users()})
+            return
+
+        # 令牌与日志都以某个账户为对象，缺省即管理员自己
+        user_id, error = self._resolve_account(payload.get("user"), current["id"])
+        if not user_id:
+            self._send(404, {"ok": False, "error": error})
+            return
+
         if path == API_PREFIX + "/tokens":
-            token_id, token = self.admin.create_token(payload.get("name"), payload.get("device"))
+            token_id, token = self.users.create_token(user_id, payload.get("name"), payload.get("device"))
             self._send(200, {
                 "ok": True,
                 "id": token_id,
                 "token": token,
-                "tokens": self.admin.list_tokens(),
+                "user": user_id,
+                "tokens": self.users.list_tokens(user_id),
             })
             return
 
         if path == API_PREFIX + "/tokens/rotate":
-            token = self.admin.rotate_token(str(payload.get("id") or ""))
+            token = self.users.rotate_token(user_id, str(payload.get("id") or ""))
             if not token:
                 self._send(404, {"ok": False, "error": "找不到该令牌"})
                 return
-            self._send(200, {"ok": True, "token": token, "tokens": self.admin.list_tokens()})
+            self._send(200, {"ok": True, "token": token, "tokens": self.users.list_tokens(user_id)})
             return
 
         if path == API_PREFIX + "/tokens/update":
-            record = self.admin.update_token(
-                str(payload.get("id") or ""), payload.get("name"), payload.get("device"), payload.get("enabled"))
+            record = self.users.update_token(
+                user_id, str(payload.get("id") or ""), payload.get("name"),
+                payload.get("device"), payload.get("enabled"))
             if not record:
                 self._send(404, {"ok": False, "error": "找不到该令牌"})
                 return
-            self._send(200, {"ok": True, "tokens": self.admin.list_tokens()})
+            self._send(200, {"ok": True, "tokens": self.users.list_tokens(user_id)})
             return
 
         if path == API_PREFIX + "/tokens/delete":
-            if not self.admin.delete_token(str(payload.get("id") or "")):
+            if not self.users.delete_token(user_id, str(payload.get("id") or "")):
                 self._send(404, {"ok": False, "error": "找不到该令牌"})
                 return
-            self._send(200, {"ok": True, "tokens": self.admin.list_tokens()})
+            self._send(200, {"ok": True, "tokens": self.users.list_tokens(user_id)})
             return
 
         # 整理日志：把已彻底删除的路径的正文历史抹掉，只留删除标记（序号不变）
         if path == API_PREFIX + "/journal/compact":
-            compacted = self.journal.compact()
+            compacted = self.users.journal(user_id).compact()
             compacted["ok"] = True
-            compacted["journal"] = self.journal.summary()
+            compacted["user"] = user_id
+            compacted["journal"] = self.users.journal(user_id).summary()
             self._send(200, compacted)
             return
 
@@ -1172,11 +1753,10 @@ class ApiHandler(BaseHTTPRequestHandler):
 
 
 def create_server(host, port, data_dir, token):
-    journal = Journal(data_dir)
-    admin = AdminStore(data_dir)
-    handler = type("BoundApiHandler", (ApiHandler,), {"journal": journal, "admin": admin, "token": token})
+    users = UserStore(data_dir)
+    handler = type("BoundApiHandler", (ApiHandler,), {"users": users, "token": token})
     httpd = ThreadingHTTPServer((host, port), handler)
-    return httpd, journal, admin
+    return httpd, users
 
 
 def selftest():
@@ -1199,7 +1779,8 @@ def selftest():
 
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = os.path.join(tmp, "data")
-        httpd, journal, admin = create_server("127.0.0.1", 0, data_dir, "secret")
+        httpd, users = create_server("127.0.0.1", 0, data_dir, "secret")
+        journal = users.journal(DEFAULT_ACCOUNT_ID)
         port = httpd.server_address[1]
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -1285,7 +1866,12 @@ def selftest():
         status, health = get(sync + "/health", token=None)
         check("health 不需要令牌", status == 200 and health.get("latestSeq") == 0, repr(health))
         check("health 标明需要令牌", health.get("authRequired") is True)
-        check("health 带回日志身份", isinstance(health.get("journalId"), str) and len(health["journalId"]) > 0)
+        check("不带凭据的 health 不报日志身份",
+              health.get("journalId") == "" and health.get("account") == "", repr(health))
+        status, health = get(sync + "/health", token="secret")
+        check("带凭据的 health 带回日志身份与账户名",
+              isinstance(health.get("journalId"), str) and len(health["journalId"]) > 0
+              and health.get("account") == DEFAULT_ACCOUNT_NAME, repr(health))
         check("health 告知同步接口前缀", health.get("syncPath") == SYNC_PATH, repr(health.get("syncPath")))
 
         status, _ = get(sync + "/ops?since=0", token=None)
@@ -1364,35 +1950,57 @@ def selftest():
 
         log("INFO", "Selftest", "section=admin")
         status, page = get("/", token=None)
-        check("根路径返回管理页面", status == 200 and "<!DOCTYPE html>" in page.get("_raw", ""), repr(page)[:160])
+        check("根路径返回网页版客户端", status == 200 and "EsprinNemo" in page.get("_raw", ""), repr(page)[:160])
 
         status, page = get("/index.html", token=None)
-        check("管理页也能按 /index.html 打开", status == 200 and "EsprinServer" in page.get("_raw", ""), repr(page)[:160])
+        check("网页版也能按 /index.html 打开", status == 200 and "<!DOCTYPE html>" in page.get("_raw", ""), repr(page)[:160])
 
-        status, css = get("/app.css", token=None)
+        status, css = get("/styles/tokens.css", token=None)
+        check("网页版样式可直接取用", status == 200 and "--bg-body" in css.get("_raw", ""), repr(css)[:80])
+
+        status, body = get("/scripts/app.js", token=None)
+        check("网页版脚本可直接取用", status == 200 and "showConnectGate" in body.get("_raw", ""), repr(body)[:80])
+
+        status, body = get("/styles/../../EsprinServer.py", token=None)
+        check("网页版静态资源不允许穿越出 web 目录", status == 404, repr(body))
+
+        status, body = get("/README.md", token=None)
+        check("网页版目录里未列入白名单的文件不对外提供", status != 200, repr(body)[:80])
+
+        status, page = get(ADMIN_PATH, token=None)
+        check("/admin 返回管理页面", status == 200 and "EsprinServer" in page.get("_raw", ""), repr(page)[:160])
+
+        status, page = get(ADMIN_PATH + "/index.html", token=None)
+        check("管理页也能按 /admin/index.html 打开", status == 200 and "<!DOCTYPE html>" in page.get("_raw", ""), repr(page)[:160])
+
+        status, page = get(ADMIN_PATH + "/", token=None)
+        check("管理页收尾斜杠同样落到页面", status == 200 and "<!DOCTYPE html>" in page.get("_raw", ""), repr(page)[:160])
+
+        status, css = get(ADMIN_PATH + "/app.css", token=None)
         check("管理页样式可直接取用", status == 200 and "--bg-body" in css.get("_raw", ""), repr(css)[:80])
 
-        status, body = get("/app.js", token=None)
+        status, body = get(ADMIN_PATH + "/app.js", token=None)
         check("管理页脚本可直接取用", status == 200 and "API_BASE" in body.get("_raw", ""), repr(body)[:80])
 
         check("管理页字体随包提供",
               os.path.isfile(os.path.join(manager_dir(), "fonts", "Mohave-VariableFont_wght.ttf")), manager_dir())
-        status, body = get("/fonts/nope.ttf", token=None)
+        status, body = get(ADMIN_PATH + "/fonts/nope.ttf", token=None)
         check("字体目录里没有的文件返回 404", status == 404, repr(body))
 
-        status, body = get("/fonts/../../EsprinServer.py", token=None)
+        status, body = get(ADMIN_PATH + "/fonts/../../EsprinServer.py", token=None)
         check("静态资源不允许穿越出 manager 目录", status == 404, repr(body))
 
-        status, page = get(LEGACY_ADMIN_PATH, token=None)
-        check("旧地址 /admin 仍然落到管理页", status == 200 and "<!DOCTYPE html>" in page.get("_raw", ""), repr(page)[:160])
-
-        status, body = get("/styles/tokens.css")
-        check("网页版资源不再对外提供", status == 404, repr(body))
+        status, body = get(ADMIN_PATH + "/nope.css", token=None)
+        check("管理页目录里没有的文件返回 404", status == 404, repr(body))
 
         status, body = get(HEALTH_PATH, token=None)
-        check("health 告知管理页入口与凭据状态",
-              status == 200 and body.get("adminPath") == "/" and body.get("apiPath") == API_PREFIX
+        check("health 告知网页版与管理页入口及凭据状态",
+              status == 200 and body.get("webPath") == "/" and body.get("adminPath") == ADMIN_PATH
+              and body.get("apiPath") == API_PREFIX
               and body.get("passwordSet") is False and body.get("authRequired") is True, repr(body))
+
+        status, body = get(sync + "/health", token=None)
+        check("同步侧的 health 同样带出入口", body.get("adminPath") == ADMIN_PATH and body.get("webPath") == "/", repr(body))
 
         status, body = get(sync + "/state", token=None)
         check("未登录的同源请求仍然 401", status == 401, repr(body))
@@ -1414,6 +2022,9 @@ def selftest():
 
         status, body = get(API_PREFIX + "/tokens", token=None, cookie=True)
         check("登录后可以看令牌列表", status == 200 and body.get("tokens") == [], repr(body))
+
+        status, body = get("/api/status", token=None, cookie=True)
+        check("管理接口只认 /admin/api 前缀", status == 404, repr(body))
 
         status, body = get(API_PREFIX + "/journal", token=None)
         check("未登录不能看日志概览", status == 401, repr(body))
@@ -1446,8 +2057,10 @@ def selftest():
         check("创建令牌并返回一次明文", status == 200 and token_a.startswith("esn_") and len(body["tokens"]) == 1, repr(body)[:160])
         check("列表里不带摘要", "digest" not in body["tokens"][0], repr(body["tokens"][0]))
 
-        reloaded = AdminStore(data_dir)
-        check("密码与令牌都已落盘", reloaded.password_set() and len(reloaded.tokens) == 1, f"{reloaded.password_set()}/{len(reloaded.tokens)}")
+        reloaded = UserStore(data_dir)
+        check("密码与令牌都已落盘",
+              reloaded.password_set() and reloaded.token_count() == 1,
+              f"{reloaded.password_set()}/{reloaded.token_count()}")
 
         status, body = post(sync + "/ops", {
             "device": "dev-lying",
@@ -1504,8 +2117,135 @@ def selftest():
 
         check("启动参数 --token 仍然可用", get(sync + "/ops?since=0")[0] == 200)
 
+        log("INFO", "Selftest", "section=accounts")
+        status, body = post(API_PREFIX + "/login",
+                            {"name": DEFAULT_ACCOUNT_NAME, "password": "new-pass-12"}, token=None, cookie=True)
+        check("重新登录管理后台", status == 200 and body.get("user", {}).get("admin") is True, repr(body))
+        admin_cookie = cookies[ADMIN_COOKIE_NAME]
+
+        status, body = get(API_PREFIX + "/users", token=None, cookie=True)
+        check("默认只有内置账户一个",
+              status == 200 and [item["name"] for item in body["users"]] == [DEFAULT_ACCOUNT_NAME]
+              and body["users"][0]["builtIn"] is True, repr(body)[:200])
+        status, body = get(API_PREFIX + "/users", token=None)
+        check("未登录不能看账户列表", status == 401, repr(body))
+
+        status, body = post(API_PREFIX + "/users/create",
+                            {"name": "  ", "password": "alice-pass-1"}, token=None, cookie=True)
+        check("账户名不能为空", status == 400, repr(body))
+        status, body = post(API_PREFIX + "/users/create",
+                            {"name": "alice", "password": "short"}, token=None, cookie=True)
+        check("新账户密码太短被拒", status == 400, repr(body))
+        status, body = post(API_PREFIX + "/users/create",
+                            {"name": "alice", "password": "alice-pass-1"}, token=None, cookie=True)
+        check("管理员新建账户",
+              status == 200 and body["user"]["name"] == "alice" and body["user"]["admin"] is False
+              and body["user"]["id"] == "alice", repr(body)[:200])
+        check("新账户的目录已建好", os.path.isdir(users.user_dir("alice")), users.user_dir("alice"))
+        status, body = post(API_PREFIX + "/users/create",
+                            {"name": "ALICE", "password": "alice-pass-1"}, token=None, cookie=True)
+        check("账户名不分大小写，重名被拒", status == 400 and "已存在" in body.get("error", ""), repr(body))
+
+        status, body = post(API_PREFIX + "/users/delete", {"id": DEFAULT_ACCOUNT_ID}, token=None, cookie=True)
+        check("内置账户不能删除", status == 400 and "不能删除" in body.get("error", ""), repr(body))
+        status, body = post(API_PREFIX + "/users/update", {"id": DEFAULT_ACCOUNT_ID, "admin": False}, token=None, cookie=True)
+        check("内置账户不能取消管理员", status == 400, repr(body))
+        status, body = post(API_PREFIX + "/users/update", {"id": DEFAULT_ACCOUNT_ID, "enabled": False}, token=None, cookie=True)
+        check("内置账户不能停用", status == 400, repr(body))
+        status, body = post(API_PREFIX + "/users/update", {"id": DEFAULT_ACCOUNT_ID, "name": "root"}, token=None, cookie=True)
+        check("内置账户不能改名", status == 400, repr(body))
+
+        status, body = post(API_PREFIX + "/login",
+                            {"name": "alice", "password": "alice-pass-1", "requireAdmin": True}, token=None)
+        check("普通账户不能登管理后台", status == 403, repr(body))
+        status, body = post(API_PREFIX + "/login", {"name": "alice", "password": "alice-pass-9"}, token=None)
+        check("账户名或密码错误时给同一句提示",
+              status == 401 and body.get("error") == "账户名或密码不正确", repr(body))
+        cookies[ADMIN_COOKIE_NAME] = admin_cookie
+
+        status, body = post(API_PREFIX + "/login",
+                            {"name": "alice", "password": "alice-pass-1"}, token=None, cookie=True)
+        alice_cookie = cookies[ADMIN_COOKIE_NAME]
+        check("普通账户可从网页版客户端登录",
+              status == 200 and body.get("user", {}).get("admin") is False, repr(body))
+        check("换了账户就是另一个会话", alice_cookie != admin_cookie)
+
+        status, body = get(API_PREFIX + "/users", token=None, cookie=True)
+        check("普通账户不能管理账户", status == 403, repr(body))
+        status, body = get(API_PREFIX + "/tokens", token=None, cookie=True)
+        check("普通账户不能访问令牌接口", status == 403, repr(body))
+        status, body = get(sync + "/state", token=None, cookie=True)
+        check("普通账户看到的是自己那份日志",
+              status == 200 and body["files"] == {} and body["latestSeq"] == 0, repr(body)[:160])
+        status, body = post(sync + "/ops", {"device": "dev-alice", "ops": [
+            {"opId": "al-1", "op": "put", "path": "notes/alice.md", "data": "alice 的一篇",
+             "hash": sha256_text("alice 的一篇")},
+        ]}, token=None, cookie=True)
+        check("普通账户可以写自己的日志", status == 200 and body["accepted"][0].get("error") is None, repr(body))
+        status, body = get(sync + "/state", token=None, cookie=True)
+        check("写入落在自己的日志里", list(body["files"].keys()) == ["notes/alice.md"], repr(body["files"]))
+        cookies[ADMIN_COOKIE_NAME] = admin_cookie
+        status, body = get(sync + "/state", token=None, cookie=True)
+        check("账户之间互不可见",
+              "notes/alice.md" not in body["files"] and body["latestSeq"] == 4, repr(body["files"]))
+
+        status, body = post(API_PREFIX + "/tokens",
+                            {"user": "alice", "name": "手机", "device": "dev-phone"}, token=None, cookie=True)
+        token_alice = body.get("token", "")
+        check("给指定账户建令牌",
+              status == 200 and token_alice.startswith("esn_") and body.get("user") == "alice", repr(body)[:160])
+        status, body = get(API_PREFIX + "/tokens?user=alice", token=None, cookie=True)
+        check("令牌按账户分开列出", status == 200 and len(body["tokens"]) == 1, repr(body)[:160])
+        status, body = get(sync + "/state", token=token_alice)
+        check("令牌读到的是它所属账户的日志",
+              status == 200 and list(body["files"].keys()) == ["notes/alice.md"], repr(body["files"])[:160])
+        status, body = get(HEALTH_PATH, token=None)
+        check("health 报出账户数与默认账户名",
+              body.get("accountCount") == 2 and body.get("defaultAccount") == DEFAULT_ACCOUNT_NAME, repr(body))
+        status, body = get(API_PREFIX + "/journal?user=alice", token=None, cookie=True)
+        check("可以按账户看日志概览",
+              status == 200 and body.get("user") == "alice" and body.get("ops") == 1, repr(body)[:160])
+        status, body = get(API_PREFIX + "/journal?user=nobody", token=None, cookie=True)
+        check("指定不存在的账户时 404", status == 404, repr(body))
+        status, headers, text = download(API_PREFIX + "/journal/download?user=alice")
+        check("可以下载指定账户的日志", status == 200 and "alice 的一篇" in text, repr(text)[:160])
+
+        status, body = post(API_PREFIX + "/users/update", {"id": "alice", "name": "Alice"}, token=None, cookie=True)
+        check("账户改名", status == 200 and body["user"]["name"] == "Alice", repr(body)[:160])
+        status, body = post(API_PREFIX + "/users/update", {"id": "alice", "name": DEFAULT_ACCOUNT_NAME}, token=None, cookie=True)
+        check("改名时不能与已有账户重名", status == 400, repr(body))
+
+        status, body = post(API_PREFIX + "/users/password", {"id": "alice", "password": "alice-pass-2"}, token=None, cookie=True)
+        check("管理员重设账户密码", status == 200 and body["users"][1]["passwordSet"] is True, repr(body)[:160])
+        cookies[ADMIN_COOKIE_NAME] = alice_cookie
+        status, body = get(API_PREFIX + "/status", token=None, cookie=True)
+        check("重设密码后该账户的旧会话失效", body.get("loggedIn") is False, repr(body))
+        cookies[ADMIN_COOKIE_NAME] = admin_cookie
+
+        status, body = post(API_PREFIX + "/users/update", {"id": "alice", "enabled": False}, token=None, cookie=True)
+        check("停用账户", status == 200 and body["user"]["enabled"] is False, repr(body))
+        status, body = get(sync + "/state", token=token_alice)
+        check("账户停用后它的令牌一并失效",
+              status == 401 and "停用" in body.get("error", ""), repr(body))
+        status, body = post(API_PREFIX + "/login", {"name": "Alice", "password": "alice-pass-2"}, token=None)
+        check("停用后不能登录", status == 401 and "停用" in body.get("error", ""), repr(body))
+        status, body = post(API_PREFIX + "/users/update", {"id": "alice", "enabled": True}, token=None, cookie=True)
+        check("重新启用账户", status == 200 and body["user"]["enabled"] is True, repr(body))
+        status, body = get(sync + "/state", token=token_alice)
+        check("启用后令牌恢复可用",
+              status == 200 and list(body["files"].keys()) == ["notes/alice.md"], repr(body["files"])[:120])
+
+        status, body = post(API_PREFIX + "/users/delete", {"id": "alice"}, token=None, cookie=True)
+        check("删除账户",
+              status == 200 and [item["id"] for item in body["users"]] == [DEFAULT_ACCOUNT_ID], repr(body)[:160])
+        check("账户目录连同数据一起删除", not os.path.exists(users.user_dir("alice")), users.user_dir("alice"))
+        status, body = get(sync + "/state", token=token_alice)
+        check("账户被删后它的令牌失效", status == 401, repr(body))
+        status, body = post(API_PREFIX + "/users/delete", {"id": "nobody"}, token=None, cookie=True)
+        check("删除不存在的账户时 400", status == 400, repr(body))
+
         log("INFO", "Selftest", "section=forced-auth")
-        strict_httpd, _, _ = create_server("127.0.0.1", 0, os.path.join(tmp, "strict-data"), "")
+        strict_httpd, _ = create_server("127.0.0.1", 0, os.path.join(tmp, "strict-data"), "")
         strict_port = strict_httpd.server_address[1]
         threading.Thread(target=strict_httpd.serve_forever, daemon=True).start()
         strict_base = f"http://127.0.0.1:{strict_port}"
@@ -1539,7 +2279,7 @@ def selftest():
         httpd.server_close()
 
         log("INFO", "Selftest", "section=reload-journal")
-        reloaded = Journal(data_dir)
+        reloaded = Journal(users.user_dir(DEFAULT_ACCOUNT_ID))
         check("最新序号一致", reloaded.latest_seq == 4, str(reloaded.latest_seq))
         check("日志身份保持不变", reloaded.journal_id == journal.journal_id, f"{reloaded.journal_id} != {journal.journal_id}")
         check("存活文件一致", sorted(reloaded.files.keys()) == ["notes/bound.md", "notes/one.md"], repr(reloaded.files))
@@ -1648,10 +2388,53 @@ def selftest():
               blank.recyclable() == [] and blank_summary["recyclable"] == 0, repr(blank_summary))
 
         log("INFO", "Selftest", "section=reload-admin")
-        reloaded_admin = AdminStore(data_dir)
-        check("管理密码重新加载后仍然有效", reloaded_admin.verify_password("new-pass-12"), "密码校验失败")
-        check("令牌保持删除后的状态", reloaded_admin.tokens == [], repr(reloaded_admin.tokens))
+        reloaded_admin = UserStore(data_dir)
+        check("管理密码重新加载后仍然有效",
+              reloaded_admin.authenticate(DEFAULT_ACCOUNT_NAME, "new-pass-12")[0] is not None, "密码校验失败")
+        check("账户只有内置的一个",
+              [item["id"] for item in reloaded_admin.list_users()] == [DEFAULT_ACCOUNT_ID],
+              repr(reloaded_admin.users))
+        check("令牌保持删除后的状态", reloaded_admin.token_count() == 0, repr(reloaded_admin.tokens))
         check("会话只存在内存里", reloaded_admin.sessions == {}, repr(reloaded_admin.sessions))
+
+        log("INFO", "Selftest", "section=legacy-migration")
+        legacy_dir = os.path.join(tmp, "legacy-data")
+        os.makedirs(legacy_dir, exist_ok=True)
+        with open(os.path.join(legacy_dir, LEGACY_ADMIN_FILE_NAME), "w", encoding="utf-8") as handle:
+            _json.dump({"version": 1, "password": hash_password("legacy-pass-1"), "secret": "a" * 64}, handle)
+        with open(os.path.join(legacy_dir, JOURNAL_NAME), "w", encoding="utf-8") as handle:
+            handle.write(_json.dumps({"seq": 1, "opId": "l-1", "op": "put",
+                                      "path": "notes/old.md", "data": "旧数据"}, ensure_ascii=False) + "\n")
+        with open(os.path.join(legacy_dir, JOURNAL_ID_NAME), "w", encoding="utf-8") as handle:
+            handle.write("legacy-journal-id")
+        with open(os.path.join(legacy_dir, TOKENS_FILE_NAME), "w", encoding="utf-8") as handle:
+            _json.dump({"version": 1, "tokens": [{"id": "tk_old", "name": "旧令牌", "digest": "x", "enabled": True}]},
+                       handle, ensure_ascii=False)
+
+        migrated = UserStore(legacy_dir)
+        admin_dir = migrated.user_dir(DEFAULT_ACCOUNT_ID)
+        check("旧版 admin.json 的密码归到内置账户名下",
+              migrated.password_set()
+              and migrated.authenticate(DEFAULT_ACCOUNT_NAME, "legacy-pass-1")[0] is not None,
+              repr(migrated.users))
+        check("旧版日志搬进内置账户目录，根目录下不再留副本",
+              os.path.isfile(os.path.join(admin_dir, JOURNAL_NAME))
+              and not os.path.exists(os.path.join(legacy_dir, JOURNAL_NAME))
+              and migrated.journal(DEFAULT_ACCOUNT_ID).latest_seq == 1,
+              repr(migrated.journal(DEFAULT_ACCOUNT_ID).state())[:160])
+        check("旧版日志身份跟着搬",
+              migrated.journal(DEFAULT_ACCOUNT_ID).journal_id == "legacy-journal-id")
+        check("旧版令牌归到内置账户名下",
+              [item["name"] for item in migrated.list_tokens(DEFAULT_ACCOUNT_ID)] == ["旧令牌"]
+              and not os.path.exists(os.path.join(legacy_dir, TOKENS_FILE_NAME)), repr(migrated.tokens))
+        check("旧版 admin.json 已归档，不会再被读到",
+              not os.path.exists(os.path.join(legacy_dir, LEGACY_ADMIN_FILE_NAME))
+              and os.path.isfile(os.path.join(legacy_dir, LEGACY_ADMIN_FILE_NAME + ".migrated")),
+              repr(sorted(os.listdir(legacy_dir))))
+        again = UserStore(legacy_dir)
+        check("再启动一次：账户、日志、令牌都还在",
+              again.password_set() and again.journal(DEFAULT_ACCOUNT_ID).latest_seq == 1
+              and len(again.list_tokens(DEFAULT_ACCOUNT_ID)) == 1, repr(again.users))
 
     if failures:
         log("ERROR", "Selftest", "failed={} cases={}".format(len(failures), ",".join(failures)))
@@ -1713,8 +2496,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Esprin Nemo 同步服务端（操作日志）")
     parser.add_argument("--host", help=f"监听地址，不传则用 {CONFIG_NAME} 里的 host，再不行用 {DEFAULT_HOST}（局域网共享可写 0.0.0.0）")
     parser.add_argument("--port", type=int, help=f"监听端口，不传则用 {CONFIG_NAME} 里的 port，再不行用 {DEFAULT_PORT}")
-    parser.add_argument("--data", default="./data", help="日志存放目录")
-    parser.add_argument("--token", default=os.environ.get("ESPRIN_TOKEN", ""), help="访问令牌；不传则凭据只来自管理后台（管理密码登录或在那里创建的访问令牌）")
+    parser.add_argument("--data", default="./data", help="数据目录：账户表与各账户的日志、令牌都在这里")
+    parser.add_argument("--token", default=os.environ.get("ESPRIN_TOKEN", ""), help="访问令牌，等同内置账户的一份令牌；不传则凭据只来自管理后台（账户密码登录或在那里创建的访问令牌）")
     parser.add_argument("--selftest", action="store_true", help="跑一遍内置自测后退出")
     args = parser.parse_args(argv)
 
@@ -1731,7 +2514,8 @@ def main(argv=None):
     host_source = "--host" if args.host else ("config" if config.get("host") else "default")
     port_source = "--port" if args.port else ("config" if config.get("port") else "default")
 
-    httpd, journal, admin = create_server(host, port, data_dir, args.token)
+    httpd, users = create_server(host, port, data_dir, args.token)
+    journal = users.journal(DEFAULT_ACCOUNT_ID)
 
     bound_host, bound_port = httpd.server_address[:2]
     if bound_host in ("0.0.0.0", "::", ""):
@@ -1744,11 +2528,14 @@ def main(argv=None):
     log("INFO", "Server", "listen={}:{} hostSource={} portSource={}".format(bound_host, bound_port, host_source, port_source))
     log("INFO", "Sync", "endpoint={}/* origin=http://{}:{}".format(SYNC_PATH, url_host, bound_port))
     log("INFO", "Storage", "journal={} journalId={} ops={} latestSeq={}".format(
-        os.path.join(data_dir, JOURNAL_NAME), journal.journal_id, journal.count, journal.latest_seq))
-    log("INFO", "Admin", "endpoint=/ pageAssets=/* api={} passwordSet={}".format(API_PREFIX, admin.password_set()))
-    log("INFO", "Auth", "tokenSource={} tokenCount={}".format("--token" if args.token else "admin", len(admin.list_tokens())))
-    if not admin.password_set() and not admin.list_tokens() and not args.token:
-        log("WARN", "Auth", "未配置任何凭据：同步接口一律返回 401 (action=打开管理页 / 设置管理密码或创建访问令牌)")
+        journal.path, journal.journal_id, journal.count, journal.latest_seq))
+    log("INFO", "Web", "endpoint=/ dir={} index={}".format(web_dir(), os.path.isfile(os.path.join(web_dir(), INDEX_NAME))))
+    log("INFO", "Admin", "endpoint={} dir={} api={} passwordSet={}".format(
+        ADMIN_PATH, manager_dir(), API_PREFIX, users.password_set()))
+    log("INFO", "Auth", "tokenSource={} accountCount={} tokenCount={}".format(
+        "--token" if args.token else "accounts", len(users.users), users.token_count()))
+    if not users.password_set() and not users.token_count() and not args.token:
+        log("WARN", "Auth", "未配置任何凭据：同步接口一律返回 401 (action=打开 {} 设置管理密码或创建访问令牌)".format(ADMIN_PATH))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

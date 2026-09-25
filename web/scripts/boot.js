@@ -22,6 +22,20 @@ const CORNER_RADIUS_VALUES = ['square', 'slight', 'default', 'large'];
 const UI_MODE_VALUES = ['classic', 'modern'];
 const AI_SCOPE_VALUES = ['current', 'all', 'none'];
 
+/* 界面尺寸（缩放比例）：浏览器里没有窗口缩放，落在根元素的 CSS 缩放（zoom）上，1 为 100%。
+   取值范围 50%~200%，与桌面版一致。取值规则写在引导脚本里：本文件先于页面其余脚本执行，
+   首屏就能按最终比例排版；normalizeUiScale 也被设置页与配置读写复用。 */
+const UI_SCALE_MIN = 0.5;
+const UI_SCALE_MAX = 2;
+const UI_SCALE_DEFAULT = 1;
+
+function normalizeUiScale(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return UI_SCALE_DEFAULT;
+    const clamped = Math.min(Math.max(num, UI_SCALE_MIN), UI_SCALE_MAX);
+    return Math.round(clamped * 100) / 100;
+}
+
 function readStoredConfig() {
     try {
         const parsed = JSON.parse(localStorage.getItem(WEB_CONFIG_KEY) || 'null');
@@ -83,13 +97,6 @@ function bootResolvedTheme() {
     }
 }
 
-// 把用户填写的字体族名转成可用的 font-family 值（含空格的族名要加引号）
-function quoteFontFamily(name) {
-    const text = String(name || '').trim();
-    if (!text) return '';
-    return /^[\w-]+$/.test(text) ? text : `"${text.replace(/"/g, '')}"`;
-}
-
 (function applyBootAppearance() {
     const root = document.documentElement;
     const stored = BOOT_CONFIG;
@@ -112,8 +119,11 @@ function quoteFontFamily(name) {
     root.classList.toggle(TABS_DISABLED_CLASS, uiMode === 'modern' && !!stored.tabsDisabled);
 
     // 侧边栏收起态：首屏按收起态绘制，不出现展开后补播动画。
-    // 窄屏下侧边栏是一条抽屉（见 styles/web.css），这一对形态不适用
+    // 窄屏下侧边栏整条收起（见 styles/web.css），这一对形态不适用
     root.classList.toggle(SIDEBAR_COLLAPSED_CLASS, !!stored.sidebarCollapsed && !bootNarrowScreen());
+
+    // 界面尺寸：无论配置里有没有这一项都显式写一次，免得上一轮遗留的比例盖过配置
+    root.style.zoom = String(normalizeUiScale(stored.uiScale));
 
     // 主题色：写在内联样式上，高于 tokens.css 里的默认值
     const accent = normalizeAccentHex(stored.accentColor);
@@ -124,15 +134,5 @@ function quoteFontFamily(name) {
         root.style.setProperty('--accent', accent);
         root.style.setProperty('--accent-bg', `rgba(${r}, ${g}, ${b}, 0.15)`);
         root.style.setProperty('--accent-fg', bootAccentForeground(accent));
-    }
-
-    // 字体：界面字体与文档字体分别覆盖，西文与 CJK 按顺序回退
-    const fonts = stored.fonts && typeof stored.fonts === 'object' ? stored.fonts : {};
-    const uiFamilies = [quoteFontFamily(fonts.uiLatin), quoteFontFamily(fonts.uiCjk)].filter(Boolean);
-    if (uiFamilies.length) root.style.setProperty('--font-sans', `${uiFamilies.join(', ')}, sans-serif`);
-    const docFamilies = [quoteFontFamily(fonts.docLatin), quoteFontFamily(fonts.docCjk)].filter(Boolean);
-    if (docFamilies.length) {
-        const fallback = quoteFontFamily(fonts.uiCjk);
-        root.style.setProperty('--font-doc', `${docFamilies.join(', ')}${fallback ? `, ${fallback}` : ''}, sans-serif`);
     }
 })();

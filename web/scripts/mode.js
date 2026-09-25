@@ -18,6 +18,21 @@ function applyUiMode() {
     root.classList.toggle(MODERN_LAYOUT_CLASS, isModernLayout());
     // 「禁用标签页」只属于现代布局：经典布局的标签页归标题栏所有，这一档不插手
     root.classList.toggle(TABS_DISABLED_CLASS, isModernLayout() && State.tabsDisabled);
+    syncNewButtonTitles();
+}
+
+// 侧边栏「新建」在两种布局下承担的事不一样，title 跟着换：
+// 现代布局里它是两枚按钮——本体新建笔记、悬停滑出的副本新建待办（见 styles/mode.css），
+// 经典布局里它仍是那一个「新建笔记或待办」的菜单入口（见 scripts/app.js 的绑定）
+function syncNewButtonTitles() {
+    const noteBtn = document.getElementById('btn-new-note');
+    const todoBtn = document.getElementById('btn-new-todo');
+    if (noteBtn) {
+        noteBtn.title = isModernLayout()
+            ? '新建笔记 (Ctrl+N)'
+            : '新建笔记或待办 (Ctrl+N / Ctrl+Shift+N)';
+    }
+    if (todoBtn) todoBtn.title = '新建待办 (Ctrl+Shift+N)';
 }
 
 // 切换布局：落盘后刷新界面与设置项
@@ -74,10 +89,16 @@ function bindSettingsBack() {
     if (back) back.onclick = () => backToNoteList();
 }
 
-// 回到笔记列表：标签页保留，只退出当前条目与设置页
+// 回到笔记列表：条目标签页保留，只退出当前条目；设置页不是条目，退出时连它那一枚标签一并收掉
 function backToNoteList() {
     if (!State.activeNoteId) return;
     flushPendingSave();
+    // 窄屏下编辑器整屏盖在列表上（见 styles/web.css 第 2.4 节）：退出时让它整块往右滑出屏幕。
+    // 设置页不在工作区里（它是另一层），因此只对真条目起步
+    if (isNarrowScreen() && getActiveItem()) beginEditorLeave();
+    if (State.activeNoteId === 'settings') {
+        State.openNoteIds = State.openNoteIds.filter((id) => id !== 'settings');
+    }
     State.activeNoteId = null;
     renderApp();
 }

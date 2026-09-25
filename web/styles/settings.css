@@ -27,10 +27,20 @@
     text-align: left;
     font-size: 12.5px;
 }
+/* 内容列：窄屏下这一列顶端还要挂一条「设置」返回条（见 styles/web.css 第 2.7 节），
+   因此把内容区包起来，滚动留给 .settings-content 自己 */
+.settings-main {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
 .settings-content {
     flex: 1;
     min-width: 0;
-    height: 100%;
+    min-height: 0;
     overflow-y: auto;
     padding: 32px 48px;
     display: flex;
@@ -144,6 +154,38 @@
     font-size: 11.5px;
     font-weight: 500;
     font-variant-numeric: tabular-nums;
+}
+/* 行标题旁边的小胶囊入口（如「缩放比例」右侧的「自定义」）：
+   它只负责把从属的那一行展开，因此紧跟行标题、不独占右侧控件位 */
+.settings-inline-toggle {
+    margin-left: 8px;
+    padding: 1px 8px;
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-pill);
+    background: var(--bg-body);
+    color: var(--text-secondary);
+    font-family: var(--font-sans);
+    font-size: 11.5px;
+    font-weight: 500;
+    line-height: 1.6;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background-color 0.15s;
+}
+.settings-inline-toggle:hover {
+    border-color: var(--text-muted);
+    color: var(--text-primary);
+}
+.settings-inline-toggle.active {
+    border-color: var(--accent);
+    background: var(--accent-bg);
+    color: var(--accent);
+}
+/* 从属行（「缩放比例」下的自定义比例）：左侧让出缩进并挂一条竖线，
+   说明它是父项展开后才出现的一行，而不是并列的另一项设置 */
+.settings-row-sub {
+    margin-left: 20px;
+    max-width: 660px;
+    border-left: 2px solid var(--accent-bg);
 }
 .settings-actions {
     display: flex;

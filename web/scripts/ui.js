@@ -168,6 +168,30 @@ async function showPrompt(message, options = {}) {
     return typeof result.value === 'string' ? result.value.trim() : '';
 }
 
+/* 口令输入：与 showPrompt 同一套用法，区别是输入框不回显明文。
+   返回原样输入的内容（口令不去首尾空白，空格本身也可以是口令的一部分），取消返回 null。 */
+async function showPasswordPrompt(message, options = {}) {
+    const result = await openDialog({
+        type: options.type || 'question',
+        icon: options.icon || 'lock',
+        message,
+        detail: options.detail || '',
+        input: {
+            value: options.value || '',
+            placeholder: options.placeholder || '',
+            label: options.label || '密码',
+            type: 'password',
+            autocomplete: 'off'
+        },
+        buttons: [
+            { id: 'cancel', label: options.cancelLabel || '取消', variant: 'default' },
+            { id: 'confirm', label: options.confirmLabel || '确定', variant: 'primary' }
+        ]
+    });
+    if (!result || result.id !== 'confirm') return null;
+    return typeof result.value === 'string' ? result.value : '';
+}
+
 /* ---------------- 自绘下拉 ----------------
    原生 <select> 留在原地当数据源（选项、value、change 事件都照旧），
    另外补一层触发器与弹出列表，避免浏览器原生下拉与界面风格脱节。 */

@@ -15,6 +15,19 @@
 .sidebar-action-wrap {
     padding: 10px 8px 4px 8px;
 }
+/* 「新建」两份的外包装：经典布局里只是一层不影响排版的包装——副本（新建待办）不排出来，
+   本体照旧是整宽按钮 + 弹出菜单（现代布局里这层要撑住两份之间的间隔，见 styles/mode.css） */
+.sidebar-new-split {
+    display: block;
+}
+.sidebar-new-split .btn-sidebar-new-extra {
+    display: none;
+}
+/* 「新建文档」那一枚图标只属于现代布局的悬停态（见 styles/mode.css），
+   经典布局里按钮上始终只有原来的加号，这一枚不排出来 */
+.btn-new-note-icon-doc {
+    display: none;
+}
 .btn-sidebar-new {
     position: relative;
     width: 100%;

@@ -1,7 +1,7 @@
 /* Alom 风格（阴影风格）：以柔和的投影与层次感为核心，覆盖 tokens.css 中的设计令牌，
    让卡片、浮层、标题栏与控件靠阴影与半透明材质拉开层次，同时放大圆角。
 
-   启用方式：设置页「外观与主题色 → 主题风格」写入 <html data-theme-style="alom">。
+   启用方式：设置页「外观 → 主题 → 界面风格」写入 <html data-theme-style="alom">。
    未选择该风格时本文件不匹配任何选择器，对界面零影响——即默认的 GitHub 风格保持不变。
    本文件与桌面版 EsprinNemo 的 styles/alom.css 逐条对应。 */
 

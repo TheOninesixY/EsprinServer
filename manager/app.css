@@ -1,7 +1,7 @@
 @font-face {
     font-family: 'Mohave';
-    src: url('/fonts/Mohave-VariableFont_wght.ttf') format('truetype-variations'),
-         url('/fonts/Mohave-VariableFont_wght.ttf') format('truetype');
+    src: url('/admin/fonts/Mohave-VariableFont_wght.ttf') format('truetype-variations'),
+         url('/admin/fonts/Mohave-VariableFont_wght.ttf') format('truetype');
     font-weight: 300 700;
     font-style: normal;
     font-display: swap;
@@ -383,6 +383,22 @@ code {
     font-size: 12px;
 }
 .settings-input.short { width: 90px; }
+select.settings-input {
+    width: auto;
+    min-width: 160px;
+    cursor: pointer;
+}
+.settings-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    user-select: none;
+}
+.settings-check input { accent-color: var(--accent); }
 
 .form-msg {
     font-size: 12px;

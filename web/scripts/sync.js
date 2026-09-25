@@ -20,6 +20,10 @@ const PUSH_DEBOUNCE_MS = 800;
 const RECYCLE_CLAIM_PATH = `${SYNC_PATH}/ids/claim`;
 const RECYCLE_CLAIM_COUNT = 2;
 const AUTO_SYNC_PRESETS = { off: 0, '5s': 5, '1m': 60, '5m': 300, startup: 0 };
+/* 账户校验的最短间隔：同步前拿 /sync/health 确认服务端认的账户仍是本地副本所属的那一个。
+   同一台浏览器可能被两个账户先后使用（甚至两个标签页同时开着不同账户），
+   不校验的话会把上一个账户的副本推给新账户、或把新账户的内容拉进旧副本。 */
+const SCOPE_VERIFY_TTL_MS = 60 * 1000;
 
 /* ---------------- SHA-256 ----------------
    同步协议里的 hash 是「文件字节的 sha256」，服务端与桌面端都按这个口径比对。
@@ -138,44 +142,132 @@ const Sync = {
     // 本机刚彻底删掉的条目腾出来的 ID：最优先（服务端那边随后也会把它收进回收池）
     locallyFreedIds: [],
     recycling: false,
+    // 本地副本所属的账户命名空间，与它上一次被服务端确认的时刻。
+    // 引导时先按上次用的那个（store.js 在 sync.js 之前载入），连上后再按服务端报的账户校正
+    scope: FileStore.scope,
+    scopeVerifiedAt: 0,
 
     init() {
-        this.readOutbox();
+        // 装载本地副本对应的同步游标与待推送队列；账户本身以连上后的 /sync/health 为准
+        this.useScope(FileStore.scope);
         this.applyAutoSyncRuntime();
+    },
+
+    /* ---------------- 本地命名空间 ----------------
+       一份本地副本、一个待推送队列、一份同步游标都挂在某个账户的命名空间下。
+       切命名空间 = 关掉旧的本地库、重新读游标与队列；界面上的条目由调用方重新装载。 */
+
+    useScope(scope) {
+        this.scope = scope;
+        this.scopeVerifiedAt = 0;
+        this.recycledIds = [];
+        this.locallyFreedIds = [];
+        // 秘密本的会话密钥只属于解开它的那个账户：换命名空间一律丢掉
+        clearSecretSession();
+        loadSyncState(scope);
+        this.readOutbox();
+    },
+
+    /* 同步前确认服务端认的账户还是本地副本所属的那一个。
+       不一致时不再同步（既不推也不拉），并要求重新登录：登录流程会把命名空间一并切过去。 */
+    async ensureAccountScope() {
+        const now = Date.now();
+        if (this.scopeVerifiedAt && now - this.scopeVerifiedAt < SCOPE_VERIFY_TTL_MS) return { ok: true };
+
+        const health = await this.apiRequest('GET', `${SYNC_PATH}/health`, null, 8000);
+        if (!health.ok) return health;
+
+        const account = String(health.data.account || '');
+        if (scopeKeyFor(account, this.baseUrl()) !== this.scope) {
+            this.connection = 'auth';
+            this.connectionMessage = account
+                ? `服务端当前的账户是「${account}」，本地副本属于另一个账户：请重新登录`
+                : '无法确认当前账户，请重新登录';
+            this.scopeVerifiedAt = 0;
+            if (typeof showConnectGate === 'function') showConnectGate(this.connectionMessage);
+            return { ok: false, error: this.connectionMessage, needAuth: true };
+        }
+
+        this.scopeVerifiedAt = now;
+        return { ok: true, account };
+    },
+
+    /* 把本地副本切到当前凭据所属账户上，顺带认领旧版（无账户）的本地副本。
+       必须在开始同步之前做完：先切命名空间，再拉日志、再推送。 */
+    async useAccountScope() {
+        const health = await this.apiRequest('GET', `${SYNC_PATH}/health`, null, 8000);
+        if (!health.ok) return health;
+
+        const account = String(health.data.account || '');
+        const scope = scopeKeyFor(account, this.baseUrl());
+        const claimed = claimLegacyScope(scope, String(health.data.journalId || ''));
+        const moved = await FileStore.useScope(scope);
+        this.useScope(scope);
+        this.scopeVerifiedAt = Date.now();
+        State.sync.account = account;
+        saveConfig();
+
+        if (moved) {
+            logSyncState(`本地副本已换到账户「${account || '未知'}」(scope=${scope})`);
+            await reloadLocalData();
+        } else if (claimed) {
+            logSyncState(`已认领旧版本地副本 (scope=${scope})`);
+        }
+        return { ok: true, account, scope, moved, claimed };
     },
 
     /* ---------------- 连接与鉴权 ---------------- */
 
     /* 探测服务端并确认凭据：先要一份无需授权的服务端信息，再用它判断该走登录还是填令牌；
-       最后拿同步接口试一次，能读就说明凭据可用。 */
+       最后拿同步接口试一次，能读就说明凭据可用。
+       整段包在 try/catch 里：connect 一开头就把状态置成 connecting，意外抛出时若没人兜底，
+       指示器会永远停在「连接中」、连接层也弹不出来（调用方的 catch 拿到的只是个被拒绝的 promise）。 */
     async connect({ reason = '启动' } = {}) {
         this.connection = 'connecting';
         this.connectionMessage = '';
         this.renderIndicator('busy');
 
-        const health = await this.apiRequest('GET', HEALTH_PATH, null, 8000);
-        if (!health.ok) {
+        try {
+            const health = await this.apiRequest('GET', HEALTH_PATH, null, 8000);
+            if (!health.ok) {
+                this.connection = 'error';
+                this.connectionMessage = health.error;
+                this.renderIndicator('error');
+                return { ok: false, error: health.error, needAuth: false };
+            }
+            this.serverInfo = health.data || {};
+
+            const probe = await this.apiRequest('GET', `${SYNC_PATH}/state`, null, 10000);
+            if (probe.ok) {
+                // 凭据可用：先确认这份凭据属于哪个账户，把本地副本切过去，再开始同步
+                const scope = await this.useAccountScope();
+                if (!scope.ok) {
+                    this.connection = 'error';
+                    this.connectionMessage = scope.error;
+                    this.renderIndicator('error');
+                    return { ok: false, error: scope.error, needAuth: false };
+                }
+                return this.startStorage(reason);
+            }
+
+            if (probe.status === 401) {
+                this.connection = 'auth';
+                this.connectionMessage = '需要登录或填写访问令牌后才能读写服务端';
+                this.renderIndicator('auth');
+                return { ok: false, error: this.connectionMessage, needAuth: true };
+            }
+
             this.connection = 'error';
-            this.connectionMessage = health.error;
+            this.connectionMessage = probe.error;
             this.renderIndicator('error');
-            return { ok: false, error: health.error, needAuth: false };
+            return { ok: false, error: probe.error, needAuth: false };
+        } catch (error) {
+            const message = error && error.message ? String(error.message) : '连接过程中出错';
+            this.connection = 'error';
+            this.connectionMessage = message;
+            this.renderIndicator();
+            return { ok: false, error: message, needAuth: false };
         }
-        this.serverInfo = health.data || {};
-
-        const probe = await this.apiRequest('GET', `${SYNC_PATH}/state`, null, 10000);
-        if (probe.ok) return this.startStorage(reason);
-
-        if (probe.status === 401) {
-            this.connection = 'auth';
-            this.connectionMessage = '需要登录或填写访问令牌后才能读写服务端';
-            this.renderIndicator('auth');
-            return { ok: false, error: this.connectionMessage, needAuth: true };
-        }
-
-        this.connection = 'error';
-        this.connectionMessage = probe.error;
-        this.renderIndicator('error');
-        return { ok: false, error: probe.error, needAuth: false };
     },
 
     // 凭据可用：把同步打开，首次使用先做一次全量接入
@@ -224,10 +316,16 @@ const Sync = {
         return result;
     },
 
-    // 管理密码登录：成功后服务端会下发同源会话 Cookie，后续同步接口直接复用
-    async login(password) {
-        const result = await this.apiRequest('POST', ADMIN_LOGIN_PATH, { password }, 10000);
+    // 账户登录：成功后服务端下发同源会话 Cookie，后续同步接口直接复用。
+    // 服务端按这个账户决定读写哪一份数据，账户名记在本地配置里省得每次重敲。
+    async login(name, password) {
+        const result = await this.apiRequest('POST', ADMIN_LOGIN_PATH, { name, password }, 10000);
         if (!result.ok) return { ok: false, error: result.error };
+        const user = (result.data && result.data.user) || {};
+        State.sync.account = String(user.name || name || '');
+        // 走会话 Cookie 时不该再带旧的访问令牌，否则会串到另一个账户上
+        State.sync.token = '';
+        saveConfig();
         // 服务端允许同名会话，登录成功即可先连通，再由调用方发起同步
         return this.connect({ reason: '登录' });
     },
@@ -236,11 +334,19 @@ const Sync = {
         await this.apiRequest('POST', ADMIN_LOGOUT_PATH, {}, 8000);
         State.sync.enabled = false;
         State.sync.token = '';
+        State.sync.account = '';
+        // 断开连接即丢掉秘密本的会话密钥：重新登录后要重新解锁
+        clearSecretSession();
         saveConfig();
         this.connection = 'idle';
         this.connectionMessage = '';
         this.applyAutoSyncRuntime();
         this.renderIndicator();
+        // 退出后不能再把上一个账户的本地副本画在界面上：换成「已退出」的命名空间并清空列表，
+        // 下一个登录的人只看得到自己的数据
+        const moved = await FileStore.useScope(SIGNED_OUT_SCOPE);
+        this.useScope(SIGNED_OUT_SCOPE);
+        if (moved) await reloadLocalData();
         return { ok: true };
     },
 
@@ -255,7 +361,7 @@ const Sync = {
 
     readOutbox() {
         try {
-            const parsed = JSON.parse(localStorage.getItem(OUTBOX_KEY) || '[]');
+            const parsed = JSON.parse(localStorage.getItem(scopeStorageNames(this.scope).outbox) || '[]');
             this.outbox = Array.isArray(parsed) ? parsed : [];
         } catch (error) {
             console.warn('[WARN] [Sync] 待推送队列读取失败: ' + (error && error.message));
@@ -265,7 +371,7 @@ const Sync = {
 
     writeOutbox() {
         try {
-            localStorage.setItem(OUTBOX_KEY, JSON.stringify(this.outbox));
+            localStorage.setItem(scopeStorageNames(this.scope).outbox, JSON.stringify(this.outbox));
         } catch (error) {
             console.error('[ERROR] [Sync] 待推送队列写入失败: ' + (error && error.message));
         }
@@ -547,6 +653,10 @@ const Sync = {
         if (!State.sync.enabled) return { ok: true, pushed: 0, remaining: this.outbox.length };
         if (!this.outbox.length) return { ok: true, pushed: 0, remaining: 0 };
 
+        // 队列里的内容属于某个账户：推送前先确认服务端认的还是它
+        const scope = await this.ensureAccountScope();
+        if (!scope.ok) return { ok: false, error: scope.error, pushed: 0, remaining: this.outbox.length };
+
         const batch = this.outbox.slice(0, PAGE_LIMIT);
         const result = await this.apiRequest('POST', `${SYNC_PATH}/ops`, {
             device: this.deviceId(),
@@ -651,6 +761,10 @@ const Sync = {
         this.renderIndicator('busy');
 
         try {
+            // 服务端认的账户必须是本地副本所属的那一个，否则一个字节都不动
+            const scope = await this.ensureAccountScope();
+            if (!scope.ok) return this.finishSync(false, scope.error, reason);
+
             // 日志身份只在首次同步或显式全量时校验：空闲态每次同步只发一个 ops 请求
             if (full || !State.sync.journalId) {
                 const identity = await this.ensureJournalIdentity();
@@ -676,19 +790,23 @@ const Sync = {
             }
             this.connection = 'ready';
             this.connectionMessage = '';
-            this.renderIndicator('idle');
             return this.finishSync(true, '', reason, summary);
+        } catch (error) {
+            return this.finishSync(false, error && error.message ? String(error.message) : '同步过程中出错', reason);
         } finally {
+            // 标志先落地再重绘：指示器是按 running 判的，反过来写的话收尾那一次会被当成
+            // 「同步中」，而此后没人再来重绘，它就一直停在那儿（自动同步下每次都这样）
             this.running = false;
+            this.renderIndicator();
         }
     },
 
+    /* 收尾：只落结果与失败原因，重绘交给调用方的 finally（那时 running 已经落地） */
     finishSync(ok, error, reason, summary = '') {
         if (!ok) {
             this.lastError = error;
             State.sync.lastSyncSummary = error;
             saveConfig();
-            this.renderIndicator('error');
             logSyncState(`同步失败 (reason=${reason}, detail=${error})`);
             return { ok: false, error };
         }
@@ -703,29 +821,34 @@ const Sync = {
         if (this.running) return { ok: false, error: '同步正在进行中' };
         this.running = true;
 
+        // 首次接入走同一套状态：四个失败分支都得记进 lastError，否则收尾那条状态行会误报成「已连接」
+        const fail = (error) => this.finishSync(false, error, '首次接入');
+
         try {
             const identity = await this.ensureJournalIdentity();
-            if (!identity.ok) return { ok: false, error: identity.error };
+            if (!identity.ok) return fail(identity.error);
 
             const pulled = await this.pullOps({ full: true });
-            if (!pulled.ok) return { ok: false, error: pulled.error };
+            if (!pulled.ok) return fail(pulled.error);
 
             const unknown = await this.pushUnknownLocalFiles();
-            if (!unknown.ok) return { ok: false, error: unknown.error };
+            if (!unknown.ok) return fail(unknown.error);
 
             const pushed = await this.pushOutbox();
-            if (!pushed.ok) return { ok: false, error: pushed.error };
+            if (!pushed.ok) return fail(pushed.error);
 
             State.sync.lastSyncAt = Date.now();
             State.sync.lastSyncSummary = `首次接入：拉取 ${pulled.applied} 条，推送 ${unknown.queued} 个本地文件`;
             saveConfig();
             this.connection = 'ready';
             if (pulled.changed && typeof refreshAfterRemoteChange === 'function') refreshAfterRemoteChange();
-            this.renderIndicator('idle');
             logSyncState(`首次接入完成 (pulled=${pulled.applied}, pushed=${unknown.queued})`);
             return { ok: true, summary: State.sync.lastSyncSummary };
+        } catch (error) {
+            return fail(error && error.message ? String(error.message) : '首次接入过程中出错');
         } finally {
             this.running = false;
+            this.renderIndicator();
         }
     },
 

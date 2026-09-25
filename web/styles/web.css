@@ -4,8 +4,14 @@
    网页版没有窗口操作键可排，却多一个同步状态入口，因此按这一组的实际宽度收窄。
    只有这两个变量的取值不同，styles/mode.css 的排版规则与桌面版逐条一致。 */
 html.modern-layout {
-    --modern-corridor: 214px;
-    --modern-tools: 214px;
+    --modern-corridor: 226px;
+    --modern-tools: 226px;
+    /* 悬浮按钮组离屏缘的距离：桌面版这一段由那 3 枚窗口操作键占着，
+       网页版改留一道带子，与经典布局标题栏的右内边距同值；走廊宽度随之加宽同样数值 */
+    --modern-edge-gap: 12px;
+}
+html.modern-layout .titlebar {
+    padding-right: var(--modern-edge-gap);
 }
 
 /* 图标字体加载失败时（离线部署且未放本地字体）退回界面字体：
@@ -162,13 +168,14 @@ html.modern-layout {
    移动端适配：平板与手机
    三档递进，桌面端的取值一律不变：
      1) ≤1180px（平板横屏）：三栏仍然并排，只是逐档收窄；
-     2) ≤860px（手机与竖屏平板）：三栏改成一栏一层——导航收成左侧抽屉，
-        列表占满整栏，打开条目时工作区整屏盖上，AI 助手与小本本同样整屏铺开；
+     2) ≤860px（手机与竖屏平板）：三栏改成一栏一层——侧边栏整条收起（分类走列表表头
+        那一枚「筛选」，设置 / 导入文件 / 深浅色在顶栏右端的菜单里，尾部分别见
+        styles/mobile.css 与 scripts/app.js），列表占满整栏，打开条目时工作区整屏盖上，
+        AI 助手与小本本同样整屏铺开；
      3) 触摸设备（pointer: coarse）：放大点击目标，并把「悬停才出现」的操作改为常显。
-   抽屉的开关只切 <html> 上的 mobile-nav-open 类名，见 scripts/app.js。
    ========================================================================== */
 
-/* 窄屏列表表头的两枚入口：桌面端不显示，搜索框照旧一行占满 */
+/* 列表表头：搜索框一行占满（窄屏那一枚「筛选」排在框内右端，见 styles/mobile.css） */
 .notes-panel-bar {
     display: flex;
     align-items: center;
@@ -177,10 +184,6 @@ html.modern-layout {
 .notes-panel-bar .search-box {
     flex: 1;
     min-width: 0;
-}
-.notes-panel-menu,
-.notes-panel-new {
-    display: none;
 }
 
 /* 安全区：内容不钻进刘海与圆角屏的边角。
@@ -212,6 +215,8 @@ html.modern-layout {
 @media (max-width: 860px) {
     /* 2.1 顶部工具按钮组：收成一行图标，下面各栏各自让出这一行 */
     html.modern-layout .titlebar {
+        /* 窄屏这条顶栏重新摊开成一条真顶栏，右端留白由 .titlebar-actions 自己给 */
+        --modern-edge-gap: 0px;
         height: calc(44px + env(safe-area-inset-top));
         padding-top: env(safe-area-inset-top);
         padding-bottom: 2px;
@@ -242,42 +247,14 @@ html.modern-layout {
         display: none;
     }
 
-    /* 2.2 导航改成左侧抽屉 */
+    /* 2.2 侧边栏整条收起：手机端不再有导航抽屉，因此抽屉的位移、遮罩与边缘手势
+       一并撤掉（见 scripts/app.js）。分类筛选在列表表头那一枚「筛选」里，
+       设置、导入文件与深浅色在顶栏右端的菜单里，两者都只在窄屏排出来 */
     .sidebar {
-        position: fixed;
-        top: 0;
-        bottom: 0;
-        left: 0;
-        width: 264px;
-        max-width: 82vw;
-        z-index: 330;
-        padding-top: env(safe-area-inset-top);
-        padding-bottom: env(safe-area-inset-bottom);
-        transform: translateX(-100%);
-        /* 收起时用一条全透明的阴影占位：抽屉整个滑出屏外后，投影的模糊范围
-           （约半个模糊半径）仍会压在屏幕左缘，留出一条没用的暗边。
-           打开时才显形，并让 box-shadow 跟着 transform 一起过渡 */
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0);
-        transition: transform var(--motion-slow) var(--ease-out),
-                    box-shadow var(--motion-slow) var(--ease-out);
-    }
-    html.mobile-nav-open .sidebar {
-        transform: none;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28);
-    }
-    /* 抽屉之外的遮罩：点它收起（见 scripts/app.js 的点击处理） */
-    html.mobile-nav-open .app-body::after {
-        content: '';
-        position: fixed;
-        inset: 0;
-        z-index: 320;
-        background: rgba(0, 0, 0, 0.45);
-    }
-    /* 「收起侧边栏」只服务并排布局，抽屉里没有它的事 */
-    #btn-toggle-sidebar {
         display: none;
     }
-    /* 浮层菜单要盖在抽屉之上（抽屉 330，菜单与右键菜单默认 300） */
+    /* 浮层菜单（自绘下拉与右键菜单默认 300，见 styles/overlays.css）：窄屏的层级另有一套，
+       见 styles/mobile.css 第 3 节与 §1.7 */
     .dropdown-menu,
     .context-menu {
         z-index: 335;
@@ -301,24 +278,6 @@ html.modern-layout {
     html.modern-layout .notes-panel-header {
         min-height: 0;
         padding: 52px 10px 10px 10px;
-    }
-    .notes-panel-bar {
-        gap: 6px;
-    }
-    .notes-panel-menu,
-    .notes-panel-new {
-        display: inline-flex;
-        width: 36px;
-        height: 36px;
-        flex-shrink: 0;
-        border-radius: var(--radius-sm);
-        color: var(--text-secondary);
-        background: var(--item-hover);
-    }
-    .notes-panel-menu:active,
-    .notes-panel-new:active {
-        background: var(--item-active);
-        color: var(--text-primary);
     }
     .notes-list {
         padding: 8px 10px calc(12px + env(safe-area-inset-bottom)) 10px;
@@ -450,17 +409,10 @@ html.modern-layout {
         font-size: 15px;
     }
 
-    /* 2.7 小本本：贴底铺开，宽度跟着屏幕走 */
-    .note-container {
-        left: calc(8px + env(safe-area-inset-left));
-        right: calc(8px + env(safe-area-inset-right));
-        bottom: calc(8px + env(safe-area-inset-bottom));
-        width: auto;
-        min-width: 0;
-        height: min(64vh, 460px);
-    }
-
-    /* 2.8 设置页：分类横排在上，内容整屏在下。
+    /* 2.7 设置页：两级 —— 第一级是分类列表，点进去才是该分类的面板。
+       层级写在 #settings-view 的 .is-subpage 上（见 scripts/settings.js），两栏因此只排出一栏；
+       桌面端两栏并排，这一节不生效（那一侧只有 .settings-crumb 等窄屏专属元素被收起）。
+       第一级的行高向底栏那几页靠拢，一屏扫得完也点得中。
        这一页自己就是整屏铺开的，右上角那组悬浮按钮会压住分类条，索性收起 */
     html:has(#settings-view:not(.hidden)) #app-titlebar {
         display: none;
@@ -468,23 +420,25 @@ html.modern-layout {
     .settings-view {
         flex-direction: column;
     }
+    /* 第一级：整屏的分类列表。行贴两侧，内边距交给行自己；
+       上下安全区由 .app-container 统一让开（见本文件第一档），这里不再重复算 */
     .settings-sidebar {
         width: 100%;
-        flex-shrink: 0;
+        flex: 1;
+        min-height: 0;
         border-right: none;
-        border-bottom: 1px solid var(--border-color);
-        padding: 6px 8px;
-        overflow-x: auto;
-        overflow-y: hidden;
+        border-bottom: none;
+        padding: 0;
+        overflow-x: hidden;
+        overflow-y: auto;
     }
-    .settings-nav {
-        flex-direction: row;
-        gap: 6px;
-    }
-    .settings-nav-item {
-        width: auto;
-        flex-shrink: 0;
-        white-space: nowrap;
+    /* 第一级顶端那条：左边「返回」回笔记列表，右边就是这一页的名字 */
+    .settings-nav-head {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        height: 48px;
+        padding: 0 8px;
     }
     html.modern-layout .settings-back,
     html:not(.modern-layout) .settings-back {
@@ -492,35 +446,180 @@ html.modern-layout {
         align-items: center;
         gap: 6px;
         width: auto;
-        padding: 6px 8px;
-        margin-bottom: 6px;
+        height: 36px;
+        padding: 0 8px;
+        margin-bottom: 0;
         border-radius: var(--radius-sm);
         color: var(--text-secondary);
-        font-size: 12.5px;
+        font-size: 13px;
+    }
+    html .settings-nav-title {
+        display: inline-flex;
+        align-items: center;
+        font-size: 17px;
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+    .settings-nav {
+        flex-direction: column;
+        gap: 0;
+    }
+    /* 行：48px 高、14.5px 正文。内边距要带 `html ` 前缀 —— 触摸档那条 .nav-item
+       晚于本节出现，同权重会把它压回 10px */
+    html .settings-nav-item {
+        width: 100%;
+        height: 48px;
+        flex-shrink: 0;
+        padding: 0 14px;
+        border-radius: 0;
+        border-bottom: 1px solid var(--border-light);
+        font-size: 14.5px;
+    }
+    html .settings-nav-item:last-child {
+        border-bottom: none;
+    }
+    html .settings-nav-item:active {
+        background-color: var(--item-active);
+    }
+    /* 行尾的箭头：触摸设备没有悬停，靠它交代「点进去还有一层」 */
+    html .settings-nav-chevron {
+        display: inline-flex;
+        color: var(--text-muted);
+    }
+    /* 第二级：该分类的面板占满整屏，顶端一条导航栏 —— 左边回分类列表，右边是当前分类 */
+    .settings-view:not(.is-subpage) .settings-main {
+        display: none;
+    }
+    .settings-view.is-subpage .settings-sidebar {
+        display: none;
+    }
+    /* 这一条必须带 `html ` 前缀：mobile.css 顶部那份「桌面端不排出来」名单里有 .settings-crumb，
+       而它在本文件之后加载，同权重时会把下面这个 display: flex 压回去 —— 那样第二级就没有返回键 */
+    html .settings-crumb {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        flex-shrink: 0;
+        height: 48px;
+        padding: 0 8px;
+        border-bottom: 1px solid var(--border-color);
+        background-color: var(--bg-editor);
+    }
+    .settings-crumb-back {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 34px;
+        height: 34px;
+        flex-shrink: 0;
+        border-radius: var(--radius-sm);
+        color: var(--text-secondary);
+    }
+    .settings-crumb-back:active {
+        background-color: var(--item-active);
+        color: var(--text-primary);
+    }
+    .settings-crumb-title {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+        overflow: hidden;
+        white-space: nowrap;
+        font-size: 17px;
+        font-weight: 600;
+        color: var(--text-primary);
+    }
+    .settings-crumb-title .ms-icon {
+        color: var(--text-secondary);
     }
     html.modern-layout .settings-view .settings-content,
     html.modern-layout body.is-fullscreen .settings-view .settings-content {
         padding: 16px;
         padding-top: 0;
     }
-    html.modern-layout .settings-view .settings-header {
-        padding-top: 16px;
+    html.modern-layout .settings-view .settings-header,
+    html:not(.modern-layout) .settings-view .settings-header {
+        /* 名称已在那条导航栏上，这一块只剩说明文字：贴导航栏留一点空即可，不再画分隔线 */
+        padding: 12px 0 0;
+        border-bottom: none;
     }
     /* 顶端渐隐（见 styles/settings.css）跟着上内边距收窄：16px 的留白里放不下 32px 的渐隐 */
     .settings-content {
         --settings-top-inset: 16px;
     }
-    .settings-row {
+    /* 面板里的字号整体压一档：内容区原本照搬桌面端（分类名 20px、设置项 14px），
+       手机上一屏只放得下三四项。正文 13.5px、说明 11.5px，分类名交给导航栏 */
+    html .settings-view .settings-title {
+        display: none;
+    }
+    html .settings-view .settings-section-title {
+        font-size: 13px;
+    }
+    html .settings-view .settings-row-label {
+        font-size: 13.5px;
+    }
+    html .settings-view .settings-row-desc {
+        font-size: 11.5px;
+        line-height: 1.5;
+    }
+    html .settings-view .settings-desc {
+        margin-top: 0;
+        font-size: 12.5px;
+    }
+    /* 按钮也收回来：触摸档按「放大点击目标」给了 36px 高，设置页里那几枚
+       （重新连接、清空本地副本…）在手机上比旁边的字号大出一圈 */
+    html .settings-view .settings-btn {
+        height: 30px;
+        padding: 0 12px;
+        font-size: 12px;
+    }
+    /* 分类面板里的盒子不再是卡片：设置项与「自定义主题色」那两块（原本都是 --bg-list 底 +
+       描边 + 圆角，Alom 风格下还带一层投影）在窄屏一律摊平成列表项 —— 圆角、描边、
+       底色与投影全去掉，项与项之间只留一条细线（末行不画）。
+       选择器多带一级 .settings-content 是为了压过 Alom 那份同族规则（它重 3 个类） */
+    html .settings-view .settings-content .settings-row,
+    html .settings-view .settings-content .accent-custom {
+        background: none;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+        max-width: none;
+    }
+    html .settings-view .settings-content .settings-row {
         flex-direction: column;
         align-items: stretch;
-        padding: 12px;
+        gap: 8px;
+        padding: 11px 0;
+        border-bottom: 1px solid var(--border-light);
     }
+    html .settings-view .settings-content .settings-row:last-child {
+        border-bottom: none;
+    }
+    html .settings-view .settings-content .accent-custom {
+        padding: 12px 0;
+    }
+    /* 段内因此不再靠 gap 拉开：设置项紧挨着排，不是设置项的那些块（段标题、色板、
+       滑块、说明、快捷键表…）各自带上边距 —— 漏一条就会有一块贴上去 */
+    .settings-section {
+        gap: 0;
+    }
+    .settings-section-title {
+        margin-bottom: 8px;
+    }
+    .settings-section > * + *:not(.settings-row) {
+        margin-top: 12px;
+    }
+    /* 控件行高收到 34px：正文仍是 16px（触摸档那条防 iOS 聚焦放大整页，见本文件第三档），
+       不让它顶着上下边框、看着比旁边的字大一圈 */
     .settings-select,
     .settings-input,
     .accent-hex-input {
         min-width: 0;
         width: 100%;
         max-width: none;
+        height: 34px;
+        padding: 0 10px;
         font-size: 16px;
     }
 
@@ -559,13 +658,6 @@ html.modern-layout {
     }
 }
 
-/* 动效偏好：导航抽屉不做滑动过渡，直接就位 */
-@media (max-width: 860px) and (prefers-reduced-motion: reduce) {
-    .sidebar {
-        transition: none !important;
-    }
-}
-
 /* ---------------- 3. 触摸设备：放大点击目标 ---------------- */
 @media (hover: none) and (pointer: coarse) {
     /* 触摸没有悬停：点一下就停住的悬停态会留在屏幕上。
@@ -582,8 +674,7 @@ html.modern-layout {
         height: 36px;
     }
     .titlebar-actions .btn-action-icon,
-    .ai-panel-header .btn-action-icon,
-    .note-titlebar .btn-action-icon {
+    .ai-panel-header .btn-action-icon {
         width: 32px;
         height: 32px;
     }
@@ -596,7 +687,10 @@ html.modern-layout {
         height: 34px;
         padding: 0 12px;
     }
-    .ai-send-btn,
+    .ai-send-btn {
+        width: 32px;
+        height: 32px;
+    }
     .ai-drawer-new {
         height: 32px;
     }
@@ -663,10 +757,19 @@ html.modern-layout {
     .settings-select,
     .accent-hex-input,
     .dialog-input,
-    .gate-input,
-    #scratchpad-title,
-    #scratchpad-content {
+    .gate-input {
         font-size: 16px;
+    }
+
+    /* 列表卡片不可选中：触摸设备上长按卡片是「打开条目菜单」的手势，不拦的话
+       系统会顺手把标题 / 摘要选上、弹出选择手柄（iOS 还会再叠一层放大镜与「拷贝」菜单）。
+       只拦这一层：正文、输入框与设置里的路径等等仍可选中（见 styles/base.css 的同一句话），
+       鼠标环境下列表也照旧可选 */
+    .notes-list {
+        -webkit-user-select: none;
+        user-select: none;
+        /* iOS：关掉长按弹出的系统菜单（拷贝 / 查询） */
+        -webkit-touch-callout: none;
     }
 
     /* 触摸设备上按压反馈必须立刻可见，这里去掉点击时浏览器补的灰色高亮块 */

@@ -6,10 +6,9 @@ const META_HEADER = 'EsprinData';
 const META_BLOCK_PATTERN = /^<!--[ \t]*EsprinData[ \t]*\r?\n([\s\S]*?)(?:\r?\n)?[ \t]*-->[ \t]*(?=\r?\n|$)/;
 const NOTE_DIR = 'notes';
 const TODO_DIR = 'todos';
-// AI 对话与小本本：与桌面版同名同目录，但**不**参与同步（同步只认 notes/ 与 todos/ 下的 Markdown），
+// AI 对话：与桌面版同名同目录，但**不**参与同步（同步只认 notes/ 与 todos/ 下的 Markdown），
 // 它们只存在本浏览器里，免得把一份带密钥痕迹的对话记进服务器的操作日志
 const AI_CHAT_DIR = 'ai_chats';
-const SCRATCHPAD_FILE = 'scratchpad.json';
 const DEFAULT_FOLDER = '默认';
 const TITLE_MAX_LENGTH = 60;
 const ITEM_KIND_KEY = '__esprinKind';
@@ -22,6 +21,139 @@ const IDB_NAME = 'esprin-nemo';
 const IDB_VERSION = 1;
 const IDB_STORE = 'files';
 const LS_FILES_KEY = 'esprin.nemo.files';
+// 同步游标（已应用到第几号、日志身份、自推序号、上次同步时间）：按账户命名空间各存一份
+const SYNC_STATE_KEY = 'esprin.nemo.sync';
+
+/* ---------------- 本地副本的账户命名空间 ----------------
+   服务端支持多个账户，同一台浏览器可能先后登录不同账户：两个账户的本地副本、待推送队列与
+   同步游标必须各存一份。混在一起的话，换账户登录会把这个账户的条目当成「服务端没见过的
+   本地文件」推上去，也会把新账户的内容拉进旧副本。
+   命名空间 = 账户名 + 服务端地址；旧版（没有账户概念的）那一份由首个对得上的账户认领，
+   认领之后继续用原来的位置，升级上来不必搬数据。
+   scope 为空串表示「还没认领的旧版命名空间」，SIGNED_OUT_SCOPE 表示已退出登录。*/
+const SCOPE_STORE_KEY = 'esprin.nemo.local.scope';
+const SCOPE_OWNER_KEY = 'esprin.nemo.local.scopeOwner';
+const SIGNED_OUT_SCOPE = 'signed-out';
+const SCOPE_SEPARATOR = '::';
+// 旧版写在通用配置里的那一份游标，由 loadConfig 填上（认领旧命名空间的账户继续用它）
+let LEGACY_SYNC_STATE = null;
+
+function scopedStorageName(base, scope) {
+    return `${base}${SCOPE_SEPARATOR}${scope || 'legacy'}`;
+}
+
+function scopeStorageNames(scope) {
+    // 认领了旧版命名空间的账户继续用原来的键名与库名
+    if (!scope || scopeOwnsLegacy(scope)) {
+        return { idb: IDB_NAME, files: LS_FILES_KEY, outbox: OUTBOX_KEY, sync: scopedStorageName(SYNC_STATE_KEY, scope) };
+    }
+    return {
+        idb: `${IDB_NAME}${SCOPE_SEPARATOR}${scope}`,
+        files: scopedStorageName(LS_FILES_KEY, scope),
+        outbox: scopedStorageName(OUTBOX_KEY, scope),
+        sync: scopedStorageName(SYNC_STATE_KEY, scope)
+    };
+}
+
+function readStoredValue(key) {
+    try {
+        return localStorage.getItem(key) || '';
+    } catch (error) {
+        return '';
+    }
+}
+
+function readCurrentScope() {
+    return readStoredValue(SCOPE_STORE_KEY);
+}
+
+function writeCurrentScope(scope) {
+    try {
+        localStorage.setItem(SCOPE_STORE_KEY, String(scope || ''));
+    } catch (error) {
+        // 写不进去只影响下次引导用哪一份，当前这次不受影响
+        console.warn('[WARN] [Storage] 本地命名空间记录写入失败: ' + (error && error.message));
+    }
+}
+
+function scopeOwnsLegacy(scope) {
+    return !!scope && readStoredValue(SCOPE_OWNER_KEY) === scope;
+}
+
+// 账户名 + 服务端地址（去掉协议与结尾斜杠）：同名账户挂在不同服务端上也不共用本地副本
+function scopeKeyFor(account, baseUrl) {
+    const name = String(account || '').trim();
+    if (!name) return '';
+    return `${name}@${serverHostFromUrl(baseUrl)}`;
+}
+
+function serverHostFromUrl(url) {
+    const text = String(url || '').trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').replace(/\/+$/, '');
+    return text || 'local';
+}
+
+/* 旧版（无账户）副本的归属判定：只有日志身份对得上时才认领。
+   服务端迁到多账户时内置账户的日志身份不变，升级上来的浏览器因此能一次对上；
+   日志身份为空（还没同步过）时也认领 —— 那是新浏览器，认领只是继承一个空位置。*/
+function claimLegacyScope(scope, journalId) {
+    if (!scope || scope === SIGNED_OUT_SCOPE || scopeOwnsLegacy(scope)) return false;
+    if (readStoredValue(SCOPE_OWNER_KEY)) return false;
+    const legacyJournalId = String((LEGACY_SYNC_STATE || {}).journalId || '');
+    if (legacyJournalId && legacyJournalId !== String(journalId || '')) return false;
+    try {
+        localStorage.setItem(SCOPE_OWNER_KEY, scope);
+    } catch (error) {
+        return false;
+    }
+    return true;
+}
+
+function syncStateStorageKey(scope = FileStore.scope) {
+    return scopeStorageNames(scope).sync;
+}
+
+function readSyncState(scope = FileStore.scope) {
+    try {
+        const parsed = JSON.parse(localStorage.getItem(syncStateStorageKey(scope)) || 'null');
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (error) {
+        return null;
+    }
+}
+
+// 同步游标按账户命名空间落盘；界面与偏好仍写在通用配置里（saveConfig）
+function saveSyncState() {
+    const payload = {
+        lastSeq: Number(State.sync.lastSeq) || 0,
+        journalId: typeof State.sync.journalId === 'string' ? State.sync.journalId : '',
+        selfPushed: Array.isArray(State.sync.selfPushed) ? State.sync.selfPushed : [],
+        lastSyncAt: Number(State.sync.lastSyncAt) || 0,
+        lastSyncSummary: typeof State.sync.lastSyncSummary === 'string' ? State.sync.lastSyncSummary : ''
+    };
+    try {
+        localStorage.setItem(syncStateStorageKey(), JSON.stringify(payload));
+    } catch (error) {
+        console.error('[ERROR] [Storage] 同步游标写入失败: ' + (error && error.message));
+    }
+}
+
+/* 把某个账户的游标装进 State.sync：优先它自己那一份；
+   认领旧命名空间（或还没认领）时回退到旧版写在通用配置里的那份，避免首次同步整份重放。*/
+function loadSyncState(scope) {
+    const stored = readSyncState(scope);
+    const fallback = !stored && (!scope || scopeOwnsLegacy(scope)) ? LEGACY_SYNC_STATE : null;
+    const data = stored || fallback || {};
+    State.sync.lastSeq = Number(data.lastSeq) || 0;
+    State.sync.journalId = typeof data.journalId === 'string' ? data.journalId : '';
+    State.sync.selfPushed = Array.isArray(data.selfPushed)
+        ? data.selfPushed
+            .map((value) => Math.round(Number(value)))
+            .filter((value) => Number.isFinite(value) && value > 0)
+        : [];
+    State.sync.lastSyncAt = Number(data.lastSyncAt) || 0;
+    State.sync.lastSyncSummary = typeof data.lastSyncSummary === 'string' ? data.lastSyncSummary : '';
+    return data;
+}
 
 const State = {
     notes: [],
@@ -47,8 +179,8 @@ const State = {
     uiMode: 'modern',
     // 现代布局下是否禁用标签页（只属于现代布局：经典布局的标签页归标题栏所有）
     tabsDisabled: false,
-    // 字体设置：空字符串表示跟随 CSS 中的默认字体栈
-    fonts: { uiLatin: '', uiCjk: '', docLatin: '', docCjk: '' },
+    // 界面尺寸（缩放比例）：1 为 100%，浏览器里落在根元素的 CSS 缩放上（见 boot.js 与 app.js）
+    uiScale: 1,
     // AI 助手：接口配置。注意密钥保存在本浏览器（localStorage）里，
     // 与桌面版交给系统密钥链保管不同——共享这台浏览器就等于共享密钥
     ai: {
@@ -68,15 +200,12 @@ const State = {
     aiAbort: null,
     aiStreamingChatId: '',
     aiPendingAttachments: [],
-    // 小本本：页内浮层，关联到某篇笔记后编辑的就是那篇
-    scratchpadOpen: false,
-    scratchpadMinimized: false,
-    scratchpadLinkedId: '',
     // 服务端存储：网页版默认把启动它的 EsprinServer 当存储，地址默认即当前站点。
-    // token 只在服务端要求令牌时使用；服务端设过管理密码时走 /admin 的登录会话（Cookie）
+    // 账户名只在走账户密码登录时用；token 只在改用访问令牌时用
     sync: {
         enabled: false,
         url: '',
+        account: '',
         token: '',
         device: '',
         autoSync: '5s',
@@ -137,32 +266,6 @@ function deleteAiChatFile(chatId) {
     return true;
 }
 
-// 小本本：未关联笔记时内容属于自己，存在数据目录的 scratchpad.json 里
-function loadScratchpadFile() {
-    const text = FileStore.memory.get(SCRATCHPAD_FILE);
-    if (typeof text !== 'string') return { title: '', content: '', linkedId: '' };
-    try {
-        const parsed = JSON.parse(text);
-        return {
-            title: typeof parsed.title === 'string' ? parsed.title : '',
-            content: typeof parsed.content === 'string' ? parsed.content : '',
-            linkedId: typeof parsed.linkedId === 'string' ? parsed.linkedId : ''
-        };
-    } catch (error) {
-        console.warn('[WARN] [Scratchpad] scratchpad.json 解析失败: ' + (error && error.message));
-        return { title: '', content: '', linkedId: '' };
-    }
-}
-
-function saveScratchpadFile(payload) {
-    FileStore.write(SCRATCHPAD_FILE, JSON.stringify({
-        title: String(payload.title || ''),
-        content: String(payload.content || ''),
-        linkedId: String(payload.linkedId || ''),
-        updatedAt: Date.now()
-    }, null, 2));
-}
-
 /* ---------------- 文件格式 ----------------
    与桌面版 storage.js 完全一致：头部注释记元数据，空行之后是正文。
    格式一致才能与桌面客户端互推：同内容写出的字节相同，哈希也相同。 */
@@ -191,12 +294,17 @@ function serializeItemFile(item, isTodo) {
         formatMetaLine('isTrashed', !!item.isTrashed)
     ];
     if (isTodo) lines.push(formatMetaLine('isDone', !!item.isDone));
+    /* 秘密本：只在这两项确实成立时写出对应行。
+       加密条目永远走 serializeSecretBody 取正文（已解锁则现做密文，未解锁则写回原密文），
+       明文因此不会出现在本地副本与同步队列里 */
+    if (item.isHidden === true) lines.push(formatMetaLine('isHidden', true));
+    if (item.locked === true) lines.push(formatMetaLine('isLocked', true));
     lines.push(formatMetaLine('createdAt', Number(item.createdAt) || Date.now()));
     lines.push(formatMetaLine('updatedAt', Number(item.updatedAt) || Date.now()));
     lines.push('-->');
 
     const header = lines.join('\n');
-    const content = String(item.content || '');
+    const content = serializeSecretBody(item);
     return content ? `${header}\n\n${content}` : `${header}\n`;
 }
 
@@ -276,6 +384,38 @@ const FileStore = {
     chain: Promise.resolve(),
     memory: new Map(),
     lsTimer: null,
+    // 当前打开的是哪个账户的本地副本（'' = 还没认领的旧版命名空间）
+    scope: readCurrentScope(),
+    idbName: IDB_NAME,
+    filesKey: LS_FILES_KEY,
+
+    /* 切到另一个账户的本地副本。位置没变时只换标记（真正切了的返回 true，调用方据此重新装载条目）。
+       必须先关掉旧连接再开新的：两个命名空间是两个库。 */
+    async useScope(scope) {
+        const names = scopeStorageNames(scope);
+        const moved = names.idb !== this.idbName || names.files !== this.filesKey;
+        this.scope = scope;
+        writeCurrentScope(scope);
+        if (!moved) return false;
+
+        // 旧命名空间里可能还有没落盘的改动（localStorage 模式是延迟写的）：
+        // 换库之前必须先刷回它自己的键，否则那几百毫秒内的编辑会跟着一起丢掉
+        clearTimeout(this.lsTimer);
+        this.lsTimer = null;
+        if (this.mode === 'localStorage') this.writeLocalStorage();
+
+        if (this.db) {
+            try { this.db.close(); } catch (error) { /* 已关闭或已失效：换库本来就要丢掉它 */ }
+        }
+        this.db = null;
+        this.mode = 'idb';
+        this.chain = Promise.resolve();
+        this.memory.clear();
+        this.idbName = names.idb;
+        this.filesKey = names.files;
+        await this.open();
+        return true;
+    },
 
     async open() {
         if (!window.indexedDB) {
@@ -285,7 +425,7 @@ const FileStore = {
         }
         try {
             this.db = await new Promise((resolve, reject) => {
-                const request = indexedDB.open(IDB_NAME, IDB_VERSION);
+                const request = indexedDB.open(this.idbName, IDB_VERSION);
                 request.onupgradeneeded = () => {
                     const db = request.result;
                     if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
@@ -302,7 +442,7 @@ const FileStore = {
 
     loadFromLocalStorage() {
         try {
-            const parsed = JSON.parse(localStorage.getItem(LS_FILES_KEY) || '{}');
+            const parsed = JSON.parse(localStorage.getItem(this.filesKey) || '{}');
             Object.keys(parsed).forEach((path) => this.memory.set(path, parsed[path]));
         } catch (error) {
             console.warn('[WARN] [Storage] 本地文件表读取失败: ' + (error && error.message));
@@ -312,15 +452,21 @@ const FileStore = {
     flushLocalStorage() {
         clearTimeout(this.lsTimer);
         this.lsTimer = setTimeout(() => {
-            const plain = {};
-            this.memory.forEach((text, path) => { plain[path] = text; });
-            try {
-                localStorage.setItem(LS_FILES_KEY, JSON.stringify(plain));
-            } catch (error) {
-                console.error('[ERROR] [Storage] localStorage 写入失败: ' + (error && error.message));
-                showToast('本地存储写入失败：容量已满，请先清理或导出数据');
-            }
+            this.lsTimer = null;
+            this.writeLocalStorage();
         }, 400);
+    },
+
+    // 立刻把内存里的文件写回当前命名空间的键（切换命名空间、退出登录前必须调）
+    writeLocalStorage() {
+        const plain = {};
+        this.memory.forEach((text, path) => { plain[path] = text; });
+        try {
+            localStorage.setItem(this.filesKey, JSON.stringify(plain));
+        } catch (error) {
+            console.error('[ERROR] [Storage] localStorage 写入失败: ' + (error && error.message));
+            showToast('本地存储写入失败：容量已满，请先清理或导出数据');
+        }
     },
 
     // 读出全部文件：{ path: text }
@@ -373,7 +519,7 @@ const FileStore = {
     async clear() {
         this.memory.clear();
         if (this.mode === 'localStorage' || !this.db) {
-            localStorage.removeItem(LS_FILES_KEY);
+            localStorage.removeItem(this.filesKey);
             return;
         }
         await new Promise((resolve) => {
@@ -425,7 +571,7 @@ function itemDisplayTitle(item) {
 }
 
 function isReadOnlyItem(item) {
-    return !!(item && item.isTrashed);
+    return !!(item && (item.isTrashed || isSecretLocked(item)));
 }
 
 function getItemById(itemId) {
@@ -473,6 +619,12 @@ function buildItemFromFile(path, text) {
         tags: meta ? readMetaTags(meta.tags) : [],
         isPinned: meta ? readMetaBoolean(meta.isPinned, false) : false,
         isTrashed: meta ? readMetaBoolean(meta.isTrashed, false) : false,
+        // 秘密本：隐藏与加密状态。locked 还要求正文确实是密文信封——
+        // 元数据写着 isLocked 而正文是明文（半途落下的文件）时按普通笔记处理，
+        // 免得把明文当成密文去解密。与桌面版 storage.js 的判定一致
+        isHidden: meta ? readMetaBoolean(meta.isHidden, false) : false,
+        locked: (meta ? readMetaBoolean(meta.isLocked, false) : false) && isSecretEnvelope(content),
+        unlocked: false,
         createdAt: meta ? readMetaNumber(meta.createdAt, now) : now,
         updatedAt: meta ? readMetaNumber(meta.updatedAt, now) : now
     };
@@ -509,6 +661,18 @@ async function loadItemsFromStore() {
     State.folders = [...new Set([DEFAULT_FOLDER, ...saved, ...used])];
 }
 
+/* 本地命名空间换过之后重新装载：条目与 AI 对话都从新的库里读，最后重绘。
+   上一个账户的文件夹清单不能留到下一个账户的界面上，所以从默认值重新算。 */
+async function reloadLocalData() {
+    clearSecretSession();
+    State.activeNoteId = null;
+    State.openNoteIds = [];
+    State.folders = [DEFAULT_FOLDER];
+    await loadItemsFromStore();
+    if (typeof loadAiChatsFromStore === 'function') await loadAiChatsFromStore();
+    if (typeof renderApp === 'function') renderApp();
+}
+
 // 保存单个条目：元数据与正文一起写回对应文件，并把改动排进同步队列
 function saveItem(item) {
     if (!item) return false;
@@ -535,6 +699,9 @@ function deleteItemFile(item) {
 function applyRemoteFile(path, text) {
     FileStore.write(path, text);
     const item = buildItemFromFile(path, text);
+    // 秘密本：远端可能重封了密文（同一把密钥、换个 IV），能就地解开就保持解锁，
+    // 解不开（对方换了口令）则丢掉会话密钥，退回未解锁
+    restoreSecretSession(item);
     const isTodo = isTodoItem(item);
     State[isTodo ? 'todos' : 'notes'] = State[isTodo ? 'todos' : 'notes'].filter((entry) => entry.id !== item.id);
     State[isTodo ? 'todos' : 'notes'].push(item);
@@ -545,6 +712,7 @@ function applyRemoteFile(path, text) {
 function removeRemoteFile(path) {
     const id = path.slice(path.lastIndexOf('/') + 1).replace(/\.md$/i, '');
     FileStore.remove(path);
+    forgetSecretKey(id);
     State.notes = State.notes.filter((item) => item.id !== id);
     State.todos = State.todos.filter((item) => item.id !== id);
     return id;
@@ -567,12 +735,7 @@ function saveConfig() {
         trashRetentionDays: State.trashRetentionDays,
         uiMode: State.uiMode,
         tabsDisabled: State.tabsDisabled,
-        fonts: {
-            uiLatin: State.fonts.uiLatin,
-            uiCjk: State.fonts.uiCjk,
-            docLatin: State.fonts.docLatin,
-            docCjk: State.fonts.docCjk
-        },
+        uiScale: normalizeUiScale(State.uiScale),
         ai: {
             enabled: State.ai.enabled,
             agentMode: State.ai.agentMode,
@@ -583,19 +746,14 @@ function saveConfig() {
             maxNotes: State.ai.maxNotes,
             systemPrompt: State.ai.systemPrompt
         },
-        scratchpadLinkedId: State.scratchpadLinkedId,
         sync: {
             enabled: State.sync.enabled,
             url: State.sync.url,
+            account: State.sync.account,
             token: State.sync.token,
             device: State.sync.device,
             autoSync: State.sync.autoSync,
-            autoSyncSeconds: State.sync.autoSyncSeconds,
-            lastSeq: State.sync.lastSeq,
-            journalId: State.sync.journalId,
-            lastSyncAt: State.sync.lastSyncAt,
-            lastSyncSummary: State.sync.lastSyncSummary,
-            selfPushed: State.sync.selfPushed
+            autoSyncSeconds: State.sync.autoSyncSeconds
         }
     };
     try {
@@ -603,6 +761,8 @@ function saveConfig() {
     } catch (error) {
         console.error('[ERROR] [Config] 配置写入失败: ' + (error && error.message));
     }
+    // 游标另存一份：它属于当前账户的命名空间，不能跟着通用配置走
+    saveSyncState();
 }
 
 function loadConfig() {
@@ -628,11 +788,7 @@ function loadConfig() {
     // 旧配置里可能存着 line / notab / minimal（旧名）与 standard（更早的经典布局名）
     State.uiMode = normalizeUiMode(parsed.uiMode);
     State.tabsDisabled = !!parsed.tabsDisabled;
-
-    const fonts = parsed.fonts && typeof parsed.fonts === 'object' ? parsed.fonts : {};
-    ['uiLatin', 'uiCjk', 'docLatin', 'docCjk'].forEach((key) => {
-        if (typeof fonts[key] === 'string') State.fonts[key] = fonts[key];
-    });
+    State.uiScale = normalizeUiScale(parsed.uiScale);
 
     const ai = parsed.ai && typeof parsed.ai === 'object' ? parsed.ai : {};
     State.ai.enabled = ai.enabled === undefined ? true : !!ai.enabled;
@@ -643,24 +799,24 @@ function loadConfig() {
     State.ai.scope = AI_SCOPE_VALUES.includes(ai.scope) ? ai.scope : 'current';
     State.ai.maxNotes = Math.max(1, Math.min(50, Number(ai.maxNotes) || 10));
     State.ai.systemPrompt = typeof ai.systemPrompt === 'string' ? ai.systemPrompt : '';
-    if (typeof parsed.scratchpadLinkedId === 'string') State.scratchpadLinkedId = parsed.scratchpadLinkedId;
 
     const sync = parsed.sync && typeof parsed.sync === 'object' ? parsed.sync : {};
     State.sync.enabled = !!sync.enabled;
     State.sync.url = typeof sync.url === 'string' ? sync.url : '';
+    State.sync.account = typeof sync.account === 'string' ? sync.account : '';
     State.sync.token = typeof sync.token === 'string' ? sync.token : '';
     State.sync.device = typeof sync.device === 'string' ? sync.device : '';
     State.sync.autoSync = typeof sync.autoSync === 'string' ? sync.autoSync : '5s';
     State.sync.autoSyncSeconds = Number(sync.autoSyncSeconds) || 60;
-    State.sync.lastSeq = Number(sync.lastSeq) || 0;
-    State.sync.journalId = typeof sync.journalId === 'string' ? sync.journalId : '';
-    State.sync.lastSyncAt = Number(sync.lastSyncAt) || 0;
-    State.sync.lastSyncSummary = typeof sync.lastSyncSummary === 'string' ? sync.lastSyncSummary : '';
-    State.sync.selfPushed = Array.isArray(sync.selfPushed)
-        ? sync.selfPushed
-            .map((value) => Math.round(Number(value)))
-            .filter((value) => Number.isFinite(value) && value > 0)
-        : [];
+    // 游标（lastSeq / journalId / selfPushed / lastSyncAt）不在这里读：它按账户命名空间存放，
+    // 由 loadSyncState 装载。旧版把它写在通用配置里，先留一份给认领旧命名空间的账户。
+    LEGACY_SYNC_STATE = {
+        lastSeq: Number(sync.lastSeq) || 0,
+        journalId: typeof sync.journalId === 'string' ? sync.journalId : '',
+        selfPushed: Array.isArray(sync.selfPushed) ? sync.selfPushed : [],
+        lastSyncAt: Number(sync.lastSyncAt) || 0,
+        lastSyncSummary: typeof sync.lastSyncSummary === 'string' ? sync.lastSyncSummary : ''
+    };
 }
 
 /* ---------------- 列表过滤与搜索 ---------------- */
@@ -698,6 +854,8 @@ function buildPreviewText(raw) {
 const PREVIEW_TEXT_CACHE = new WeakMap();
 
 function itemPreviewText(item) {
+    // 加密条目没解锁时没有明文可展示（正文是密文信封）
+    if (isSecretLocked(item)) return '已加密的正文（解锁后可读）';
     const raw = typeof item.content === 'string' ? item.content : '';
     const cached = PREVIEW_TEXT_CACHE.get(item);
     if (cached && cached.source === raw) return cached.text;
@@ -710,7 +868,8 @@ const SEARCH_TEXT_CACHE = new WeakMap();
 
 function itemSearchText(item) {
     const title = typeof item.title === 'string' ? item.title : '';
-    const content = typeof item.content === 'string' ? item.content : '';
+    // 未解锁的加密条目只按标题匹配：内存里的正文是密文
+    const content = isSecretLocked(item) ? '' : (typeof item.content === 'string' ? item.content : '');
     const cached = SEARCH_TEXT_CACHE.get(item);
     if (cached && cached.title === title && cached.content === content) return cached.text;
     const text = `${title}\n${content}`.toLowerCase();
@@ -718,9 +877,9 @@ function itemSearchText(item) {
     return text;
 }
 
-// 当前筛选下的条目：笔记 / 待办各自一个入口，其余视图两类混排，置顶优先
-function getFilteredItems() {
-    const filter = State.currentFilter;
+// 某个筛选下的条目：笔记 / 待办各自一个入口，其余视图两类混排，置顶优先。
+// filter 默认取当前筛选；传别的值是给窄屏滑动切页时拼「相邻页」用的（见 scripts/app.js）
+function getFilteredItems(filter = State.currentFilter) {
     const isTrashView = filter === 'trash';
     const isPinnedView = filter === 'pinned';
     const onlyNotes = filter === 'all';
@@ -734,6 +893,8 @@ function getFilteredItems() {
     const consider = (item, isTodo) => {
         if (onlyNotes && isTodo) return;
         if (onlyTodos && !isTodo) return;
+        // 隐藏的条目不进任何视图（只在「设置 → 秘密本」里能看到）
+        if (isSecretHidden(item)) return;
 
         if (item.isTrashed) {
             if (!isTrashView) return;
@@ -780,10 +941,17 @@ function panelCategoryTitle(filter) {
     return '全部笔记';
 }
 
+/* 当前筛选是不是「分类过滤」（文件夹 / 标签）：底栏那四页之外的另一类筛选。
+   列表表头的筛选键点不点亮、面板里排不排「清除筛选」，都问它 */
+function isCategoryFilter(filter) {
+    return filter.startsWith('folder:') || filter.startsWith('tag:');
+}
+
+// 搜索框提示的正文。快捷键那截由渲染层按屏幕档位补（窄屏没有 Ctrl+K，见 scripts/render.js）
 function searchPlaceholderText(filter) {
-    if (filter === 'all') return '搜索笔记... (Ctrl+K)';
-    if (filter === 'todos') return '搜索待办... (Ctrl+K)';
-    return '搜索笔记与待办... (Ctrl+K)';
+    if (filter === 'all') return '搜索笔记...';
+    if (filter === 'todos') return '搜索待办...';
+    return '搜索笔记与待办...';
 }
 
 /* ---------------- 数据备份 ---------------- */
@@ -798,12 +966,16 @@ function exportBackup() {
             id: item.id,
             kind: isTodoItem(item) ? 'todo' : 'note',
             title: item.title,
-            content: item.content,
+            // 秘密本：已解锁的条目导出时同样写密文，备份文件里不出现明文
+            content: serializeSecretBody(item),
             folder: item.folder,
             tags: item.tags,
             isPinned: !!item.isPinned,
             isTrashed: !!item.isTrashed,
             isDone: !!item.isDone,
+            // 秘密本：备份同样要带上这两项，否则加密正文会被当成普通笔记导出
+            isHidden: item.isHidden === true,
+            locked: item.locked === true,
             createdAt: item.createdAt,
             updatedAt: item.updatedAt
         }))
@@ -835,14 +1007,18 @@ function importBackup(raw, { replace = false } = {}) {
         const now = Date.now();
         const createdAt = Number(entry.createdAt);
         const updatedAt = Number(entry.updatedAt);
+        const content = typeof entry.content === 'string' ? entry.content : '';
         const item = {
             id,
             title: typeof entry.title === 'string' ? entry.title : '',
-            content: typeof entry.content === 'string' ? entry.content : '',
+            content,
             folder: typeof entry.folder === 'string' && entry.folder.trim() ? entry.folder.trim() : DEFAULT_FOLDER,
             tags: Array.isArray(entry.tags) ? entry.tags.filter((tag) => typeof tag === 'string' && tag.trim()) : [],
             isPinned: !!entry.isPinned,
             isTrashed: !!entry.isTrashed,
+            // 秘密本：按与文件解析同一套规则恢复状态（内容是否真是密文由这里判）
+            isHidden: !!entry.isHidden,
+            locked: !!entry.locked && isSecretEnvelope(content),
             createdAt: Number.isFinite(createdAt) ? Math.round(createdAt) : now,
             updatedAt: Number.isFinite(updatedAt) ? Math.round(updatedAt) : now
         };
@@ -858,6 +1034,8 @@ function importBackup(raw, { replace = false } = {}) {
 
 async function clearAllData() {
     await FileStore.clear();
+    // 明文副本与密钥一并丢掉：重新拉回来的都是密文
+    clearSecretSession();
     State.notes = [];
     State.todos = [];
     State.folders = [DEFAULT_FOLDER];

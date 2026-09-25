@@ -36,6 +36,7 @@
     --radius-base-md: 8px;
 
     /* 动效：时长与缓动曲线。styles/motion.css 里的进场动画与换肤交叉淡入统一引用这几个令牌 */
+    --motion-fast: 0.12s;
     --motion-base: 0.18s;
     --motion-slow: 0.26s;
     /* 换肤时的整屏颜色过渡时长，与 scripts/app.js 的 APPEARANCE_FADE_MS 对齐 */

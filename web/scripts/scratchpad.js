@@ -49,11 +49,22 @@ function updateScratchpadLinkLabel() {
 // 打开小本本时载入内容：已关联则取那篇笔记，否则取 scratchpad.json
 function loadScratchpadContent() {
     const item = scratchpadLinkedItem();
+    // 已关联的笔记正文加密时小本本不接管：网页版解不开密文，接管只会看到一串密文
+    if (item && isSecretLocked(item)) {
+        State.scratchpadLinkedId = '';
+        document.getElementById('scratchpad-title').value = '';
+        document.getElementById('scratchpad-content').value = '';
+        updateScratchpadLinkLabel();
+        updateScratchpadCount();
+        setScratchpadState('只读 · 原笔记正文已加密（需在桌面版解锁）');
+        return;
+    }
+
     const payload = item
         ? { title: item.title || '', content: item.content || '' }
         : loadScratchpadFile();
 
-    if (!item && payload.linkedId && getItemById(payload.linkedId)) {
+    if (!item && payload.linkedId && getItemById(payload.linkedId) && !isSecretLocked(getItemById(payload.linkedId))) {
         // 上次关联的笔记还在：继续编辑它
         State.scratchpadLinkedId = payload.linkedId;
         const linked = getItemById(payload.linkedId);
@@ -92,6 +103,10 @@ function commitScratchpadSave() {
     const item = scratchpadLinkedItem();
 
     if (item) {
+        if (isSecretLocked(item)) {
+            setScratchpadState('只读 · 正文已加密（需在桌面版解锁）');
+            return false;
+        }
         if (isReadOnlyItem(item)) {
             setScratchpadState('只读 · 位于废纸篓');
             return false;
@@ -171,7 +186,7 @@ function renderScratchpadPicker() {
     list.innerHTML = '';
 
     const notes = State.notes
-        .filter((item) => !item.isTrashed)
+        .filter((item) => !item.isTrashed && !isSecretHidden(item) && !isSecretLocked(item))
         .filter((item) => !keyword || itemSearchText(item).includes(keyword))
         .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
         .slice(0, 100);

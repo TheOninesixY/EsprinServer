@@ -172,30 +172,16 @@ function buildAiAgentToolPayload() {
 }
 
 function syncAiAgentToggle() {
-    const toggle = document.getElementById('ai-agent-mode');
-    if (toggle) toggle.checked = isAiAgentMode();
-    const hint = document.getElementById('ai-agent-hint');
-    if (hint) {
-        hint.textContent = isAiAgentMode() ? '可修改笔记' : '仅回答问题';
-        hint.dataset.on = isAiAgentMode() ? '1' : '';
-    }
+    const toggle = document.getElementById('ai-agent-toggle');
+    if (!toggle) return;
+    // 外观沿用标题栏 AI 助手按钮那一套：开启时挂 .active，颜色与底色由 .btn-action-icon.active 给
+    const on = isAiAgentMode();
+    toggle.classList.toggle('active', on);
+    toggle.setAttribute('aria-pressed', on ? 'true' : 'false');
 }
 
-async function toggleAiAgentMode(enabled) {
-    if (enabled) {
-        const confirmed = await showConfirm('开启 Agent 模式？', {
-            title: 'Agent 模式',
-            detail: '开启后 AI 可以直接新建与修改你的笔记：正文、标题、文件夹、标签、置顶，以及把笔记移入废纸篓。\n'
-                + '每一步操作都会在对话里列出，并带「撤销」按钮；移入废纸篓前仍会单独向你确认。',
-            icon: 'smart_toy',
-            confirmLabel: '开启'
-        });
-        if (!confirmed) {
-            syncAiAgentToggle();
-            return;
-        }
-    }
-
+// 直接切换开关，不再弹确认框；开启后的风险由每条操作自带的「撤销」承担
+function toggleAiAgentMode(enabled) {
     State.ai.agentMode = !!enabled;
     saveConfig();
     syncAiAgentToggle();
@@ -281,12 +267,14 @@ function collectAiContextNotes() {
 
     if (scope === 'current') {
         const item = getActiveItem();
-        return item ? [item] : [];
+        // 加密且未解锁的条目正文是密文，附上去没有意义
+        return item && !isSecretLocked(item) ? [item] : [];
     }
 
     const limit = Math.max(1, Math.min(50, Number(State.ai.maxNotes) || AI_CONTEXT_MAX_NOTES));
+    // 隐藏与加密的条目都不进提问范围
     return [...State.notes, ...State.todos]
-        .filter((item) => !item.isTrashed)
+        .filter((item) => !item.isTrashed && !isSecretHidden(item) && !isSecretLocked(item))
         .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
         .slice(0, limit);
 }
@@ -310,21 +298,50 @@ function buildAiContextMessage() {
     return `以下是用户当前的笔记内容，请结合它们回答：\n\n${parts.join('\n\n---\n\n')}`;
 }
 
-function updateAiContextHint() {
-    const hint = document.getElementById('ai-context-hint');
-    if (!hint) return;
-    const scope = State.ai.scope || 'current';
-    const notes = collectAiContextNotes();
-    if (scope === 'none') {
-        hint.textContent = '附带：不附带笔记';
-        return;
+/* 输入框里那条下拉：附带范围的选项文字与可选项都跟着「当前打开的笔记」走。
+   开着笔记时第一项写作「附带当前笔记：<笔记名>」；没有打开的笔记时这一项直接收起来，
+   下拉里只剩「附带全部笔记 / 不附带笔记」。
+
+   收起时范围会临时让给「不附带笔记」——取不到笔记时这两项效果完全一样（都拿不到上下文），
+   但用户的偏好还得记着：等重新打开笔记，范围自动回到「附带当前笔记」（标记见下）。
+   用户自己动手改过范围就作数，标记随之清掉，不再自动改回去。 */
+let aiScopeParkedForMissingNote = false;
+
+function updateAiScopeOptions() {
+    const select = document.getElementById('ai-scope-select');
+    if (!select) return;
+
+    const item = getActiveItem();
+    const currentOption = select.querySelector('option[value="current"]');
+
+    if (item) {
+        const label = `附带当前笔记：${itemDisplayTitle(item)}`;
+        if (!currentOption) {
+            const option = document.createElement('option');
+            option.value = 'current';
+            option.textContent = label;
+            select.insertBefore(option, select.firstElementChild);
+        } else if (currentOption.textContent !== label) {
+            // 改的是选项文字：自绘下拉的触发器与菜单都跟着这个原生 select 走（见 scripts/ui.js）
+            currentOption.textContent = label;
+        }
+        if (aiScopeParkedForMissingNote) {
+            aiScopeParkedForMissingNote = false;
+            State.ai.scope = 'current';
+        }
+    } else if (currentOption) {
+        currentOption.remove();
+        if (State.ai.scope === 'current') {
+            aiScopeParkedForMissingNote = true;
+            State.ai.scope = 'none';
+        }
     }
-    if (scope === 'current') {
-        const item = getActiveItem();
-        hint.textContent = item ? `附带：当前笔记《${itemDisplayTitle(item)}》` : '附带：当前笔记（未打开任何笔记）';
-        return;
-    }
-    hint.textContent = `附带：全部笔记（${notes.length} 篇，上限 ${State.ai.maxNotes}）`;
+
+    // 原生 select 是自绘下拉的数据源：范围与选项文字都可能刚变过，触发器与菜单一并刷新
+    if (select.value !== State.ai.scope) select.value = State.ai.scope;
+    const entry = CUSTOM_SELECTS.find((item) => item.select === select);
+    markCustomSelectDirty(entry);
+    refreshCustomSelect(entry);
 }
 
 /* ---------------- 面板开关 ---------------- */
@@ -333,23 +350,46 @@ function updateAiContextHint() {
    renderApp 每次都会调它一次，因此打开设置页时面板会被就地收起，退出设置页再展开。 */
 let aiPanelExpanded = false;
 let aiPanelHideTimer = null;
+let aiPanelHideListener = null;
 
-function clearAiPanelHideTimer() {
+// 取消「正在进行的收起」：清掉兜底定时器，并摘掉挂在面板上的 transitionend
+function cancelAiPanelHide(panel) {
     clearTimeout(aiPanelHideTimer);
     aiPanelHideTimer = null;
+    if (aiPanelHideListener && panel) panel.removeEventListener('transitionend', aiPanelHideListener);
+    aiPanelHideListener = null;
+}
+
+/* 收起：位移过渡真的走完再挂 .hidden —— display: none 会当场把过渡切断，
+   而写死一个时长（原为 300ms）在手机上会被掉帧拖成「滑到一半就消失」。
+   定时器只当兜底：过渡未触发时（例如系统开了「减少动态效果」）仍能收尾。 */
+function scheduleAiPanelHide(panel) {
+    cancelAiPanelHide(panel);
+    // 收起用的位移/宽度两种情形：窄屏是 transform，桌面是 width
+    const collapseProps = ['transform', 'width'];
+    aiPanelHideListener = (event) => {
+        if (event.target !== panel || !collapseProps.includes(event.propertyName)) return;
+        cancelAiPanelHide(panel);
+        if (!aiPanelExpanded) panel.classList.add('hidden');
+    };
+    panel.addEventListener('transitionend', aiPanelHideListener);
+    aiPanelHideTimer = setTimeout(() => {
+        cancelAiPanelHide(panel);
+        if (!aiPanelExpanded) panel.classList.add('hidden');
+    }, 600);
 }
 
 function applyAiPanelVisibility() {
     const panel = document.getElementById('ai-panel');
-    const button = document.getElementById('btn-ai-assistant');
     if (!panel) return;
 
     const inSettings = State.activeNoteId === 'settings';
     const visible = isAiEnabled() && !!State.aiPanelOpen && !inSettings;
-    if (button) {
+    // 标题栏那枚与窄屏编辑器顶栏那枚同步显隐与点亮
+    document.querySelectorAll('#btn-ai-assistant, #btn-editor-ai').forEach((button) => {
         button.classList.toggle('hidden', !isAiEnabled());
         button.classList.toggle('active', visible);
-    }
+    });
 
     if (visible === aiPanelExpanded) {
         // 已经到位（或正往同一方向动）：不重启过渡，只补上「不显示时顺手收起抽屉」
@@ -359,7 +399,7 @@ function applyAiPanelVisibility() {
     aiPanelExpanded = visible;
 
     if (visible) {
-        clearAiPanelHideTimer();
+        cancelAiPanelHide(panel);
         panel.classList.remove('hidden');
         // 先以收起态入场，下一帧再展开：否则宽度过渡没有起点，面板会「啪」地出现
         if (panel.classList.contains('ai-collapsed')) {
@@ -374,16 +414,12 @@ function applyAiPanelVisibility() {
     panel.classList.add('ai-collapsed');
     if (inSettings) {
         // 设置页占据整个窗口：这一下属于「页面切换」而不是「收起面板」，与侧边栏一样瞬间到位
-        clearAiPanelHideTimer();
+        cancelAiPanelHide(panel);
         panel.classList.add('hidden');
         return;
     }
-    // .hidden 是 display: none，一旦先挂上宽度过渡就没机会播，因此等过渡走完再收
-    clearAiPanelHideTimer();
-    aiPanelHideTimer = setTimeout(() => {
-        aiPanelHideTimer = null;
-        if (!aiPanelExpanded) panel.classList.add('hidden');
-    }, 300);
+    // .hidden 是 display: none，一旦先挂上就没机会播过渡，因此等位移走完再收
+    scheduleAiPanelHide(panel);
 }
 
 function openAiPanel() {
@@ -397,7 +433,7 @@ function openAiPanel() {
     renderAiMessages();
     renderAiChatList();
     updateAiModelChip();
-    updateAiContextHint();
+    updateAiScopeOptions();
     scrollAiToBottom();
 }
 
@@ -558,7 +594,7 @@ function insertAiAnswerToNote(msg) {
         return;
     }
     if (isReadOnlyItem(item)) {
-        showToast('废纸篓中的条目为只读，无法插入');
+        showToast(isSecretLocked(item) ? '正文已加密：解锁后才能写入' : '废纸篓中的条目为只读，无法插入');
         return;
     }
     const addition = msg.content || '';
@@ -619,8 +655,11 @@ function buildAiEmptyState() {
     `;
     empty.querySelectorAll('.ai-example-chip').forEach((chip) => {
         chip.onclick = () => {
-            document.getElementById('ai-input').value = chip.dataset.prompt || '';
-            sendAiMessage();
+            // 点了只填进输入框，用户可再编辑（与桌面版 scripts/ai.js 一致）
+            const input = document.getElementById('ai-input');
+            input.value = chip.dataset.prompt || '';
+            updateAiComposerState();
+            input.focus();
         };
     });
     return empty;
@@ -657,7 +696,7 @@ function renderAiChatList() {
             State.aiActiveConversationId = chat.id;
             closeAiDrawer();
             renderAiMessages();
-            updateAiContextHint();
+            updateAiScopeOptions();
             scrollAiToBottom();
         };
 
@@ -774,6 +813,7 @@ function renderAiAttachments() {
     strip.innerHTML = '';
     strip.classList.toggle('hidden', !State.aiPendingAttachments.length);
     State.aiPendingAttachments.forEach((file) => strip.appendChild(buildAiAttachmentChip(file, true)));
+    updateAiComposerState();
 }
 
 async function importAiAttachments(fileList) {
@@ -999,7 +1039,7 @@ async function sendAiMessage() {
     State.aiStreaming = true;
     State.aiStreamingChatId = chat.id;
     State.aiAbort = new AbortController();
-    updateAiStreamingUI(true);
+    updateAiComposerState();
     renderAiChatList();
 
     try {
@@ -1031,7 +1071,7 @@ async function sendAiMessage() {
         State.aiStreaming = false;
         State.aiStreamingChatId = '';
         State.aiAbort = null;
-        updateAiStreamingUI(false);
+        updateAiComposerState();
         touchAiConversation(chat);
         renderAiMessages();
         renderAiChatList();
@@ -1065,16 +1105,21 @@ function aiScopeLabel() {
     return '当前笔记';
 }
 
-function updateAiStreamingUI(streaming) {
-    document.getElementById('btn-ai-send').classList.toggle('hidden', streaming);
-    document.getElementById('btn-ai-stop').classList.toggle('hidden', !streaming);
-    const hint = document.getElementById('ai-agent-hint');
-    if (hint && streaming) {
-        hint.textContent = '生成中…';
-        hint.dataset.on = '1';
-    } else {
-        syncAiAgentToggle();
+/* 输入区的可用状态：输入为空时发送按钮置灰，生成期间整枚收起只留「停止」，
+   附件按钮跟随 AI 助手总开关。与桌面版 scripts/ai.js 的 updateAiComposerState 一致。 */
+function updateAiComposerState() {
+    const input = document.getElementById('ai-input');
+    const sendBtn = document.getElementById('btn-ai-send');
+    const stopBtn = document.getElementById('btn-ai-stop');
+    const attachBtn = document.getElementById('btn-ai-attach');
+    const hasContent = !!input && (input.value.trim().length > 0 || State.aiPendingAttachments.length > 0);
+
+    if (sendBtn) {
+        sendBtn.classList.toggle('hidden', State.aiStreaming);
+        sendBtn.disabled = !hasContent;
     }
+    if (stopBtn) stopBtn.classList.toggle('hidden', !State.aiStreaming);
+    if (attachBtn) attachBtn.disabled = !isAiEnabled();
 }
 
 function stopAiStreaming() {
@@ -1100,13 +1145,15 @@ function findNoteById(id) {
     return getItemById(String(id || '').trim());
 }
 
-// 工具里允许用标题代替 id
+// 工具里允许用标题代替 id（隐藏与加密的条目不做标题兜底匹配）
 function resolveAiAgentNote(rawId) {
     const text = String(rawId || '').trim();
     if (!text) return null;
     const byId = findNoteById(text);
     if (byId) return byId;
-    return [...State.notes, ...State.todos].find((item) => itemDisplayTitle(item) === text) || null;
+    return [...State.notes, ...State.todos].find((item) => itemDisplayTitle(item) === text
+        && !isSecretHidden(item)
+        && !isSecretLocked(item)) || null;
 }
 
 function normalizeTagList(raw) {
@@ -1127,7 +1174,7 @@ async function executeAiAgentTool(name, args) {
         const tag = String(input.tag || '').replace(/^#/, '').trim();
         const keyword = String(input.keyword || '').trim().toLowerCase();
         const list = [...State.notes, ...State.todos]
-            .filter((item) => !item.isTrashed)
+            .filter((item) => !item.isTrashed && !isSecretHidden(item) && !isSecretLocked(item))
             .filter((item) => !folder || item.folder === folder)
             .filter((item) => !tag || (Array.isArray(item.tags) && item.tags.includes(tag)))
             .filter((item) => !keyword || `${item.title}\n${item.content}`.toLowerCase().includes(keyword))
@@ -1147,6 +1194,7 @@ async function executeAiAgentTool(name, args) {
     if (name === 'read_note') {
         const item = resolveAiAgentNote(input.id);
         if (!item) return aiAgentToolResult(false, `没有找到笔记：${input.id}`);
+        if (isSecretLocked(item)) return aiAgentToolResult(false, `《${itemDisplayTitle(item)}》正文已加密：解锁后才能读取`);
         const content = String(item.content || '');
         return aiAgentToolResult(true, `读取《${itemDisplayTitle(item)}》`, {
             data: {
@@ -1183,6 +1231,7 @@ async function executeAiAgentTool(name, args) {
     if (name === 'update_note_content') {
         const item = resolveAiAgentNote(input.id);
         if (!item) return aiAgentToolResult(false, `没有找到笔记：${input.id}`);
+        if (isSecretLocked(item)) return aiAgentToolResult(false, `《${itemDisplayTitle(item)}》正文已加密：解锁后才能改写`);
         const before = String(item.content || '');
         const next = String(input.content || '');
         const undo = () => {
@@ -1356,12 +1405,14 @@ function initAiPanel() {
     scopeSelect.value = State.ai.scope || 'current';
     scopeSelect.onchange = () => {
         State.ai.scope = AI_SCOPE_VALUES.includes(scopeSelect.value) ? scopeSelect.value : 'current';
+        // 用户自己挑过范围就不再自动改回去（见 updateAiScopeOptions）
+        aiScopeParkedForMissingNote = false;
         saveConfig();
-        updateAiContextHint();
+        updateAiScopeOptions();
     };
 
-    const agentToggle = document.getElementById('ai-agent-mode');
-    agentToggle.onchange = () => toggleAiAgentMode(agentToggle.checked);
+    const agentToggle = document.getElementById('ai-agent-toggle');
+    agentToggle.onclick = () => toggleAiAgentMode(!isAiAgentMode());
     syncAiAgentToggle();
 
     document.getElementById('btn-ai-new-chat').onclick = () => {
@@ -1393,6 +1444,7 @@ function initAiPanel() {
     document.getElementById('btn-ai-attach').onclick = pickAiAttachments;
 
     const input = document.getElementById('ai-input');
+    input.oninput = updateAiComposerState;
     input.addEventListener('keydown', (event) => {
         // Enter 发送，Shift+Enter 换行；输入法组合期间不接管
         if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
@@ -1428,7 +1480,8 @@ function initAiPanel() {
     applyAiEnabledState();
     renderAiAttachments();
     updateAiModelChip();
-    updateAiContextHint();
+    updateAiScopeOptions();
+    updateAiComposerState();
 
     if (State.aiPanelOpen) {
         State.aiPanelOpen = false;

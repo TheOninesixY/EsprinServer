@@ -18,6 +18,10 @@ function getActiveItem() {
 
 function openTab(itemId) {
     if (!itemId) return;
+    // 设置页不是条目：离开它去开别的条目时，把它那一枚标签一并收掉
+    if (itemId !== 'settings') {
+        State.openNoteIds = State.openNoteIds.filter((id) => id !== 'settings');
+    }
     if (!State.openNoteIds.includes(itemId)) State.openNoteIds.push(itemId);
     State.activeNoteId = itemId;
 }
@@ -25,6 +29,8 @@ function openTab(itemId) {
 function openSettingsTab() {
     if (!State.openNoteIds.includes('settings')) State.openNoteIds.push('settings');
     State.activeNoteId = 'settings';
+    // 窄屏的设置是两级：每次进来先落在分类列表上，而不是上次那个分类的面板（见 scripts/settings.js）
+    setSettingsSubpageOpen(false);
     renderApp();
 }
 
@@ -191,8 +197,10 @@ function toggleTodoDone(itemId) {
 }
 
 // 导出为 .md：元数据内嵌在文件里，这里只导出正文，与桌面版的行为一致
-function exportItemMarkdown(itemId) {
+async function exportItemMarkdown(itemId) {
     if (State.activeNoteId === itemId) flushPendingSave();
+    // 加密条目先解锁：导出的是正文，不是密文信封
+    if (!await ensureItemRevealed(itemId)) return;
     const item = getItemById(itemId);
     if (!item) return;
     const name = `${item.title || `无标题${itemKindLabel(item)}`}.md`;
@@ -202,6 +210,7 @@ function exportItemMarkdown(itemId) {
 
 async function copyItemContent(itemId) {
     if (State.activeNoteId === itemId) flushPendingSave();
+    if (!await ensureItemRevealed(itemId)) return;
     const item = getItemById(itemId);
     if (!item) return;
     const ok = await copyText(item.content || '');
@@ -246,8 +255,14 @@ async function clearTrash() {
     });
     if (!confirmed) return;
 
+    performClearTrash();
+}
+
+// 真正的清空。确认步骤由调用方负责：侧边栏那枚走 showConfirm 弹窗，
+// 手机底栏那枚（废纸篓下由「新建」换成「清空」）用贴底面板确认，两者不叠加。
+function performClearTrash() {
     [...State.notes, ...State.todos].filter((item) => item.isTrashed).forEach((item) => deleteItemFile(item));
-    State.openNoteIds = State.openNoteIds.filter((id) => id === 'settings' || !!getItemById(id));
+    State.openNoteIds = State.openNoteIds.filter((id) => !!getItemById(id));
     State.notes = State.notes.filter((item) => !item.isTrashed);
     State.todos = State.todos.filter((item) => !item.isTrashed);
     renderApp();
@@ -267,7 +282,7 @@ function purgeExpiredTrashItems() {
     const ids = new Set(expired.map((item) => item.id));
     State.notes = State.notes.filter((item) => !ids.has(item.id));
     State.todos = State.todos.filter((item) => !ids.has(item.id));
-    State.openNoteIds = State.openNoteIds.filter((id) => id === 'settings' || !ids.has(id));
+    State.openNoteIds = State.openNoteIds.filter((id) => !ids.has(id));
     if (ids.has(State.activeNoteId)) State.activeNoteId = State.openNoteIds[State.openNoteIds.length - 1] || null;
     return ids.size;
 }

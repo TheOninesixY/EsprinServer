@@ -22,6 +22,7 @@ function renderCounts() {
     let trashedCount = 0;
 
     State.notes.forEach((note) => {
+        if (isSecretHidden(note)) return;
         if (note.isTrashed) trashedCount += 1;
         else {
             activeNoteCount += 1;
@@ -29,6 +30,7 @@ function renderCounts() {
         }
     });
     State.todos.forEach((todo) => {
+        if (isSecretHidden(todo)) return;
         if (todo.isTrashed) trashedCount += 1;
         else {
             activeTodoCount += 1;
@@ -45,10 +47,56 @@ function renderCounts() {
     document.querySelectorAll('.nav-section-main .nav-item').forEach((el) => {
         el.classList.toggle('active', el.getAttribute('data-filter') === State.currentFilter);
     });
+    // 手机端底部导航与侧边栏是同一套筛选：选中态跟着一起走（见 styles/mobile.css）
+    document.querySelectorAll('.mobile-tab[data-filter]').forEach((el) => {
+        el.classList.toggle('active', el.getAttribute('data-filter') === State.currentFilter);
+    });
+    // 同一枚「新建」在废纸篓下换成「清空」（图标、title 与展开哪张面板一起换）
+    applyMobileFabMode(State.currentFilter === 'trash');
+    // 列表表头的筛选：落在文件夹 / 标签上时点亮（其余四页的入口在底栏里）
+    const filterToggle = document.getElementById('btn-list-filter');
+    if (filterToggle) filterToggle.classList.toggle('active', isCategoryFilter(State.currentFilter));
 
     const clearBtn = document.getElementById('btn-empty-trash');
     clearBtn.classList.toggle('hidden', State.currentFilter !== 'trash');
     document.getElementById('panel-category-title').textContent = panelCategoryTitle(State.currentFilter);
+}
+
+/* 窄屏底栏中间那一枚：平时是「新建」（滑开二选一面板），切到废纸篓时改成「清空」
+   （滑开确认面板）。展开态与两张面板的显隐交给 styles/mobile.css 的 .sheet-open /
+   .trash-mode；这里同步图标、提示文字与 aria-controls，图标的换字形走一次淡入淡出。 */
+const FAB_ICON_FADE_MS = 120;   // 与 mobile.css 里 .fab-circle .ms-icon 的 opacity 过渡（--motion-fast）成对改
+
+let fabIconTimer = 0;
+
+function applyMobileFabMode(trashMode) {
+    const bar = document.getElementById('mobile-tabbar');
+    const fab = document.getElementById('btn-mobile-fab');
+    const icon = document.getElementById('btn-mobile-fab-icon');
+    if (!bar || !fab || !icon) return;
+
+    bar.classList.toggle('trash-mode', trashMode);
+    swapFabIcon(fab, icon, trashMode ? 'delete_forever' : 'add');
+    fab.title = trashMode ? '清空废纸篓' : '新建笔记或待办';
+    fab.setAttribute('aria-controls', trashMode ? 'mobile-trash-sheet' : 'mobile-new-sheet');
+}
+
+/* 把图标淡掉、换字形、再淡回来。淡出期间又切一次（连着点两个页面）只保留最后一次：
+   清掉计时器，字形等最后一次一起换；若两次切换正好抵回原字形（淡出还没走完），
+   这里直接摘掉淡出态，图标原地淡回来即可 */
+function swapFabIcon(button, icon, glyph) {
+    clearTimeout(fabIconTimer);
+    fabIconTimer = 0;
+    if (icon.textContent === glyph) {
+        button.classList.remove('icon-fading');
+        return;
+    }
+    button.classList.add('icon-fading');
+    fabIconTimer = setTimeout(() => {
+        fabIconTimer = 0;
+        icon.textContent = glyph;
+        button.classList.remove('icon-fading');
+    }, FAB_ICON_FADE_MS);
 }
 
 function renderFolders() {
@@ -81,20 +129,15 @@ function renderFolders() {
 }
 
 function renderTags() {
-    const tagSet = new Set();
-    [...State.notes, ...State.todos].forEach((item) => {
-        if (item.isTrashed) return;
-        if (Array.isArray(item.tags)) item.tags.forEach((tag) => { if (tag) tagSet.add(tag); });
-    });
-
     const container = document.getElementById('sidebar-tag-list');
     container.innerHTML = '';
-    if (!tagSet.size) {
+    const tags = allTags();
+    if (!tags.length) {
         container.innerHTML = '<span style="font-size: 11px; color: var(--text-muted); padding: 4px;">无标签</span>';
         return;
     }
 
-    Array.from(tagSet).sort((a, b) => a.localeCompare(b, 'zh-CN')).forEach((tag) => {
+    tags.forEach((tag) => {
         const isSelected = State.currentFilter === `tag:${tag}`;
         const pill = document.createElement('span');
         pill.className = `tag-pill ${isSelected ? 'active' : ''}`;
@@ -106,6 +149,16 @@ function renderTags() {
         });
         container.appendChild(pill);
     });
+}
+
+/* 现存标签（不含废纸篓与加密条目）：侧边栏的标签栏与窄屏的筛选面板共用 */
+function allTags() {
+    const tagSet = new Set();
+    [...State.notes, ...State.todos].forEach((item) => {
+        if (item.isTrashed || isSecretHidden(item)) return;
+        if (Array.isArray(item.tags)) item.tags.forEach((tag) => { if (tag) tagSet.add(tag); });
+    });
+    return Array.from(tagSet).sort((a, b) => a.localeCompare(b, 'zh-CN'));
 }
 
 /* ---------------- 标签页 ---------------- */
@@ -219,7 +272,7 @@ function bindTabDrag(tab, container) {
 function renderTabs() {
     const container = currentTabsContainer();
     // 关掉已经不存在的条目留下的标签
-    State.openNoteIds = State.openNoteIds.filter((id) => id === 'settings' || !!getItemById(id));
+    State.openNoteIds = State.openNoteIds.filter((id) => !!getItemById(id));
     if (State.activeNoteId && State.activeNoteId !== 'settings' && !getItemById(State.activeNoteId)) {
         State.activeNoteId = State.openNoteIds[State.openNoteIds.length - 1] || null;
     }
@@ -289,24 +342,37 @@ function playListEnter(container, key) {
 
 function renderListPanel() {
     const container = document.getElementById('notes-list-box');
-    const list = getFilteredItems();
-    const isTrashView = State.currentFilter === 'trash';
 
     const searchInput = document.getElementById('input-search');
-    const placeholder = searchPlaceholderText(State.currentFilter);
+    // 桌面端补上快捷键那截；窄屏的软键盘上没有修饰键，只留正文
+    const placeholder = searchPlaceholderText(State.currentFilter) + (isNarrowScreen() ? '' : ' (Ctrl+K)');
     if (searchInput.placeholder !== placeholder) searchInput.placeholder = placeholder;
     searchInput.value = State.searchQuery;
     document.getElementById('btn-search-clear').classList.toggle('hidden', !State.searchQuery);
     document.getElementById('select-sort').value = State.sortBy;
 
+    const list = fillListContainer(container, State.currentFilter);
+    // 空列表不挂进场动画：一句说明没什么可错开落位的
+    if (!list.length) return;
+
+    playListEnter(container, `${State.currentFilter}\u0001${State.sortBy}\u0001${State.searchQuery}\u0001`
+        + list.map((item) => item.id).sort().join(','));
+}
+
+/* 把某个筛选下的卡片铺进容器（空则一句说明），返回该筛选下的条目。
+   与窄屏滑动切页时那张「相邻页」共用，两处因此永远长得一样（见 scripts/app.js 的 bindFilterSwipe） */
+function fillListContainer(container, filter) {
+    const list = getFilteredItems(filter);
+    const isTrashView = filter === 'trash';
+
     container.innerHTML = '';
     if (!list.length) {
         container.innerHTML = `
             <div class="list-empty">
-                ${State.searchQuery ? '无匹配内容' : '暂无内容<br>点击左上角「新建」创建笔记或待办'}
+                ${State.searchQuery ? '无匹配内容' : '暂无内容<br>点「新建」创建笔记或待办'}
             </div>
         `;
-        return;
+        return list;
     }
 
     const fragment = document.createDocumentFragment();
@@ -314,9 +380,15 @@ function renderListPanel() {
         fragment.appendChild(isTodoItem(item) ? createTodoCard(item, isTrashView) : createNoteCard(item, isTrashView));
     });
     container.appendChild(fragment);
+    return list;
+}
 
-    playListEnter(container, `${State.currentFilter}\u0001${State.sortBy}\u0001${State.searchQuery}\u0001`
-        + list.map((item) => item.id).sort().join(','));
+/* 相邻页：与列表同一套样式（类名相同）的一整页卡片，滑动时临时挂在列表旁边 */
+function buildListPage(filter) {
+    const page = document.createElement('div');
+    page.className = 'notes-list';
+    fillListContainer(page, filter);
+    return page;
 }
 
 function createNoteCard(note) {
@@ -325,6 +397,7 @@ function createNoteCard(note) {
     card.innerHTML = `
         <div class="note-card-title">
             <span>${escapeHTML(note.title || '未命名笔记')}</span>
+            ${note.locked === true ? '<span class="ms-icon xs fill" style="color: var(--accent);">lock</span>' : ''}
             ${note.isPinned ? '<span class="ms-icon xs fill" style="color: var(--accent);">push_pin</span>' : ''}
         </div>
         <div class="note-card-preview">${escapeHTML(itemPreviewText(note))}</div>
@@ -347,6 +420,7 @@ function createTodoCard(todo, isTrashView) {
         <div class="todo-card-body">
             <div class="note-card-title">
                 <span>${escapeHTML(todo.title || '未命名待办')}</span>
+                ${todo.locked === true ? '<span class="ms-icon xs fill" style="color: var(--accent);">lock</span>' : ''}
                 ${todo.isPinned ? '<span class="ms-icon xs fill" style="color: var(--accent);">push_pin</span>' : ''}
             </div>
             <div class="note-card-preview">${escapeHTML(itemPreviewText(todo))}</div>
@@ -366,7 +440,16 @@ function createTodoCard(todo, isTrashView) {
 }
 
 function bindCardEvents(card, item) {
-    card.addEventListener('click', () => {
+    // 长按弹出的菜单会紧接着收到一次 click：那一下不算「打开条目」，也不让它冒到 document
+    let suppressClick = false;
+
+    card.addEventListener('click', (event) => {
+        if (suppressClick) {
+            suppressClick = false;
+            event.preventDefault();
+            event.stopPropagation();
+            return;
+        }
         openTab(item.id);
         renderApp();
     });
@@ -374,6 +457,40 @@ function bindCardEvents(card, item) {
         event.preventDefault();
         showItemContextMenu(event.clientX, event.clientY, item.id);
     });
+
+    // 手机端没有右键：卡片右上角的「更多」与长按都落到同一套菜单（按钮只在窄屏排出来）
+    const more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'note-card-more';
+    more.title = '更多操作';
+    more.innerHTML = '<span class="ms-icon sm">more_vert</span>';
+    more.addEventListener('click', (event) => {
+        event.stopPropagation();
+        const box = more.getBoundingClientRect();
+        showItemContextMenu(box.right - 6, box.bottom + 4, item.id);
+    });
+    card.appendChild(more);
+
+    let pressTimer = 0;
+    const cancelPress = () => {
+        if (!pressTimer) return;
+        clearTimeout(pressTimer);
+        pressTimer = 0;
+    };
+    card.addEventListener('touchstart', (event) => {
+        if (event.touches.length !== 1) return;
+        const touch = event.touches[0];
+        pressTimer = setTimeout(() => {
+            pressTimer = 0;
+            suppressClick = true;
+            // 长按与右键同义：轻震一下给出「已经触发」的反馈
+            if (navigator.vibrate) navigator.vibrate(10);
+            showItemContextMenu(touch.clientX, touch.clientY, item.id);
+        }, 500);
+    }, { passive: true });
+    card.addEventListener('touchmove', cancelPress, { passive: true });
+    card.addEventListener('touchend', cancelPress);
+    card.addEventListener('touchcancel', cancelPress);
 }
 
 /* ---------------- 工作区 ---------------- */
@@ -411,10 +528,13 @@ function renderWorkspace() {
     const panelElements = [topbar, toolbar, titleArea, contentArea, footer];
 
     if (!item) {
-        emptyState.classList.remove('hidden');
-        panelElements.forEach((el) => el.classList.add('hidden'));
-        document.getElementById('editor-pane').classList.add('hidden');
-        document.getElementById('preview-pane').classList.add('hidden');
+        // 窄屏退出编辑器时整块正在往右滑出屏幕（见 scripts/app.js 的 beginEditorLeave）：
+        // 各段先原样留着，等滑完的收尾重绘再收起 —— 同一帧就收起的话，滑出去的只是一块空板子
+        const leaving = isEditorLeaving();
+        emptyState.classList.toggle('hidden', leaving);
+        panelElements.forEach((el) => el.classList.toggle('hidden', !leaving));
+        document.getElementById('editor-pane').classList.toggle('hidden', !leaving);
+        document.getElementById('preview-pane').classList.toggle('hidden', !leaving);
         // 本地为空且尚未接上服务端时才提示接入，避免长期占位
         const hint = document.getElementById('empty-hint');
         const isEmpty = !State.notes.length && !State.todos.length;
@@ -423,7 +543,7 @@ function renderWorkspace() {
         if (showHint) {
             hint.textContent = '暂无内容：登录服务端后可拉取服务器上已有的笔记';
         }
-        updateAiContextHint();
+        updateAiScopeOptions();
         return;
     }
 
@@ -437,7 +557,8 @@ function renderWorkspace() {
 
     titleInput.placeholder = isTodo ? '无标题待办...' : '无标题笔记...';
     if (document.activeElement !== titleInput) titleInput.value = item.title || '';
-    if (document.activeElement !== contentInput) contentInput.value = item.content || '';
+    // 加密条目：正文取出来的是密文信封，不往编辑器里放（由只读提示接手）
+    if (document.activeElement !== contentInput) contentInput.value = isSecretLocked(item) ? '' : (item.content || '');
     contentInput.spellcheck = !!State.spellcheck;
 
     // 文件夹下拉
@@ -496,11 +617,12 @@ function renderWorkspace() {
     }
 
     applyEditorReadOnly(item);
+    applySecretLockUI(item);
     updateViewModeUI();
     flushRenderMarkdown();
     updateStats();
     updateSaveStatus();
-    updateAiContextHint();
+    updateAiScopeOptions();
 }
 
 /* ---------------- 编辑器 ----------------
@@ -535,6 +657,13 @@ function renderMarkdown(force = false) {
 
     const item = getActiveItem();
     const itemId = item ? item.id : null;
+    // 加密且未解锁的条目：正文还是密文，解析出来没有意义，预览直接留空
+    if (isSecretLocked(item)) {
+        lastPreviewItemId = itemId;
+        lastPreviewContent = null;
+        document.getElementById('preview-content').innerHTML = '';
+        return;
+    }
     const content = item ? (item.content || '') : '';
     if (!force && itemId === lastPreviewItemId && content === lastPreviewContent) return;
     lastPreviewItemId = itemId;
@@ -582,16 +711,18 @@ function countWords(text) {
 function updateStats() {
     const item = getActiveItem();
     if (!item) return;
-    const content = item.content || '';
-    document.getElementById('stat-char-count').textContent = `字符: ${content.length}`;
-    document.getElementById('stat-word-count').textContent = `字数: ${countWords(content)}`;
+    const content = isSecretLocked(item) ? '' : (item.content || '');
+    document.getElementById('stat-char-count').textContent = isSecretLocked(item) ? '字符: —' : `字符: ${content.length}`;
+    document.getElementById('stat-word-count').textContent = isSecretLocked(item) ? '字数: —' : `字数: ${countWords(content)}`;
     document.getElementById('stat-last-edit').textContent = `修改于 ${formatDate(item.updatedAt)}`;
 }
 
 const READONLY_STATUS_TEXT = '只读 · 位于废纸篓';
+const LOCKED_STATUS_TEXT = '只读 · 正文已加密（未解锁）';
 
 function applyEditorReadOnly(item) {
     const readOnly = isReadOnlyItem(item);
+    const locked = isSecretLocked(item);
     const titleInput = document.getElementById('input-note-title');
     const contentInput = document.getElementById('textarea-note-content');
     const toolbar = document.getElementById('editor-toolbar');
@@ -605,15 +736,16 @@ function applyEditorReadOnly(item) {
     toolbar.classList.toggle('hidden', readOnly);
 
     const saveStatus = document.getElementById('save-status');
-    if (readOnly) saveStatus.textContent = READONLY_STATUS_TEXT;
-    else if (saveStatus.textContent === READONLY_STATUS_TEXT) saveStatus.textContent = '就绪';
+    if (readOnly) saveStatus.textContent = locked ? LOCKED_STATUS_TEXT : READONLY_STATUS_TEXT;
+    else if (saveStatus.textContent === READONLY_STATUS_TEXT || saveStatus.textContent === LOCKED_STATUS_TEXT) saveStatus.textContent = '就绪';
 }
 
 function updateSaveStatus() {
     const item = getActiveItem();
     if (!item || isReadOnlyItem(item)) return;
-    if (document.getElementById('save-status').textContent === READONLY_STATUS_TEXT) {
-        document.getElementById('save-status').textContent = '就绪';
+    const status = document.getElementById('save-status');
+    if (status.textContent === READONLY_STATUS_TEXT || status.textContent === LOCKED_STATUS_TEXT) {
+        status.textContent = '就绪';
     }
 }
 
@@ -729,9 +861,10 @@ function renderSyncIndicator(state) {
     icon.textContent = 'cloud_done';
     text.textContent = '已连接';
     chip.classList.add('state-online');
+    const who = State.sync.account ? `账户 ${State.sync.account} · ` : '';
     chip.title = State.sync.lastSyncAt
-        ? `上次同步 ${formatDateTime(State.sync.lastSyncAt)} · ${State.sync.lastSyncSummary}（点击立即同步）`
-        : '已连接服务端，尚未同步；点击立即同步';
+        ? `${who}上次同步 ${formatDateTime(State.sync.lastSyncAt)} · ${State.sync.lastSyncSummary}（点击立即同步）`
+        : `已连接服务端（${who}尚未同步）；点击立即同步`;
 }
 
 // 远端变更落进本地后刷新界面。设置页里正在填写内容时只刷列表与状态，
@@ -753,7 +886,8 @@ function refreshAfterRemoteChange() {
 function hideContextMenu() {
     const menu = document.getElementById('context-menu');
     menu.classList.add('hidden');
-    menu.dataset.menuKind = '';
+    // data-menu-kind 留到下次 buildContextMenu 再改写：窄屏收起时整块面板还要滑一段，
+    // 层级（条目菜单压在底栏之下）得继续按原来那一种菜单算，见 styles/mobile.css 第 3 节
     contextMenuItemId = null;
 }
 
@@ -772,8 +906,9 @@ function buildContextMenu(x, y, entries, kind = '') {
             return;
         }
         const button = document.createElement('div');
-        button.className = `context-menu-item ${entry.danger ? 'danger' : ''}`;
-        button.innerHTML = `<span class="ms-icon sm">${entry.icon}</span><span>${escapeHTML(entry.label)}</span>`;
+        button.className = `context-menu-item ${entry.danger ? 'danger' : ''} ${entry.active ? 'active' : ''}`;
+        button.innerHTML = `<span class="ms-icon sm">${entry.icon}</span><span>${escapeHTML(entry.label)}</span>`
+            + (entry.active ? '<span class="ms-icon sm context-menu-item-check">check</span>' : '');
         button.onclick = () => {
             hideContextMenu();
             entry.action();
@@ -814,6 +949,19 @@ function showItemContextMenu(x, y, itemId) {
                 label: item.isDone ? '标记为未完成' : '标记为已完成',
                 action: () => toggleTodoDone(itemId)
             });
+        }
+        /* 秘密本：隐藏与密码。隐藏后条目不再出现在任何列表里，只能去「设置 → 秘密本」找回。
+           已解锁的加密条目另给一个马上重新上锁的入口 */
+        entries.push({
+            icon: item.isHidden === true ? 'visibility' : 'visibility_off',
+            label: item.isHidden === true ? '取消隐藏' : '隐藏文档',
+            action: () => toggleItemHidden(itemId)
+        });
+        entries.push(item.locked === true
+            ? { icon: 'key_off', label: '解除密码', action: () => removeItemPassword(itemId) }
+            : { icon: 'lock', label: '设置密码', action: () => setItemPassword(itemId) });
+        if (item.locked === true && item.unlocked === true) {
+            entries.push({ icon: 'lock', label: '立即锁定', action: () => lockItemNow(itemId) });
         }
         entries.push({ icon: 'content_copy', label: '复制正文', action: () => copyItemContent(itemId) });
         entries.push({ icon: 'download', label: '导出 Markdown', action: () => exportItemMarkdown(itemId) });
@@ -866,12 +1014,64 @@ function showNewItemMenu(x, y) {
     ], 'new-item');
 }
 
-// 「新建」按钮：同一个按钮反复点击时在展开与收起之间切换
-function toggleNewItemMenu(x, y) {
+/* 列表表头的「筛选」（窄屏专有）：手机端没有侧边栏，文件夹与标签过滤收在这一张面板里
+   （四个主入口不在这里 —— 它们在底部主导航里）。当前生效的那一条带对勾；
+   正筛着文件夹 / 标签时头一条是「清除筛选」，回到「全部笔记」 */
+function showFilterMenu(x, y) {
+    const entries = [];
+    if (isCategoryFilter(State.currentFilter)) {
+        entries.push({ icon: 'filter_list_off', label: '清除筛选', action: () => applyMobileFilter('all') });
+        entries.push({ divider: true });
+    }
+
+    State.folders.forEach((folder) => entries.push({
+        icon: 'folder',
+        label: folder,
+        active: State.currentFilter === `folder:${folder}`,
+        action: () => applyMobileFilter(`folder:${folder}`)
+    }));
+    entries.push({ icon: 'create_new_folder', label: '新建文件夹', action: () => addFolder() });
+
+    const tags = allTags();
+    if (tags.length) {
+        entries.push({ divider: true });
+        tags.forEach((tag) => entries.push({
+            icon: 'label',
+            label: `#${tag}`,
+            active: State.currentFilter === `tag:${tag}`,
+            action: () => applyMobileFilter(`tag:${tag}`)
+        }));
+    }
+    buildContextMenu(x, y, entries, 'filter');
+}
+
+/* 顶栏右端的菜单（窄屏专有）：深浅色、设置与导入文件收在一处
+   （桌面端这三件分别在顶栏的图标、侧边栏底栏里） */
+function showTopbarMenu(x, y) {
+    const dark = resolvedTheme() === 'dark';
+    buildContextMenu(x, y, [
+        {
+            icon: dark ? 'light_mode' : 'dark_mode',
+            label: dark ? '切换到浅色' : '切换到深色',
+            action: () => toggleTheme()
+        },
+        { icon: 'settings', label: '设置', action: () => openSettingsTab() },
+        { icon: 'upload_file', label: '导入文件', action: () => pickImportFiles() }
+    ], 'topbar');
+}
+
+/* 几处菜单入口共用：同一个入口反复点击时在展开与收起之间切换
+   （kind 记在 dataset 上，改用另一个入口打开时重建） */
+function toggleContextMenu(kind, build, x, y) {
     const menu = document.getElementById('context-menu');
-    if (menu.dataset.menuKind === 'new-item' && !menu.classList.contains('hidden')) {
+    if (menu.dataset.menuKind === kind && !menu.classList.contains('hidden')) {
         hideContextMenu();
         return;
     }
-    showNewItemMenu(x, y);
+    build(x, y);
+}
+
+// 「新建」按钮：同一个按钮反复点击时在展开与收起之间切换
+function toggleNewItemMenu(x, y) {
+    toggleContextMenu('new-item', showNewItemMenu, x, y);
 }
